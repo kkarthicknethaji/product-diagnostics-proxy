@@ -28,6 +28,7 @@ const PORT = process.env.PORT || 3000;
 // Phase 3: tighten to authenticated origins only.
 const ALLOWED_ORIGINS = [
   'https://productdiagnostics.netlify.app',
+  'https://devproductdiagnostics.netlify.app',
   'http://localhost',
   'http://127.0.0.1',
   'null' // file:// origin (local open-in-browser)
