@@ -29,6 +29,7 @@ const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGINS = [
   'https://productdiagnostics.netlify.app',
   'https://devproductdiagnostics.netlify.app',
+  'https://productgrowth.netlify.app',
   'http://localhost',
   'http://127.0.0.1',
   'null' // file:// origin (local open-in-browser)
