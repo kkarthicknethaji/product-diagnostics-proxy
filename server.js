@@ -25,6 +25,10 @@ const jwt      = require('jsonwebtoken');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust Render's load balancer so express-rate-limit reads the real client IP
+// from X-Forwarded-For instead of the proxy IP. Fixes rate-limit log warning.
+app.set('trust proxy', 1);
+
 // ── Env vars ──────────────────────────────────────────────────────────────────
 const ALLOWED_ORIGIN      = process.env.ALLOWED_ORIGIN      || '';
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET || '';
