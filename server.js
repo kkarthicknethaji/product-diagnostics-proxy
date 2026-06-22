@@ -4,23 +4,28 @@
 //
 // Responsibilities:
 //   - Receive POST /api/anthropic from browser (Netlify frontend)
-//   - Verify Supabase JWT from X-Auth-Token header — reject unauthenticated requests
+//   - Verify Supabase JWT from X-Auth-Token header using JWKS (ES256 / ECC P-256)
 //   - Forward to Anthropic server-side (no CORS restrictions, no timeout)
 //   - API key priority: ANTHROPIC_API_KEY env var (shared org key) → user BYOK key fallback
 //   - Returns structured JSON errors — never raw HTML
 //   - Rate limit: 20 req/min per IP
 //
 // Required env vars (set in Render dashboard):
-//   ALLOWED_ORIGIN      — single origin allowed e.g. https://devproductdiagnostics.netlify.app
-//   SUPABASE_JWT_SECRET — from Supabase project → Settings → API → JWT Secret
-//   SUPABASE_URL        — from Supabase project → Settings → API → Project URL
-//   ANTHROPIC_API_KEY   — optional shared org key; if unset, falls back to user BYOK key
+//   ALLOWED_ORIGIN    — single origin allowed e.g. https://devproductdiagnostics.netlify.app
+//   SUPABASE_URL      — from Supabase project → Settings → API → Project URL
+//                       e.g. https://enozfttaoxhomesdonrc.supabase.co
+//                       JWKS endpoint derived automatically: SUPABASE_URL/auth/v1/.well-known/jwks.json
+//   ANTHROPIC_API_KEY — optional shared org key; if unset, falls back to user BYOK key
+//
+// Removed env vars (no longer needed — Supabase migrated from HS256 to ECC P-256):
+//   SUPABASE_JWT_SECRET — delete from Render dashboard; JWKS verification replaces it
 // ─────────────────────────────────────────────────────────────────────────────
 
-const express  = require('express');
-const cors     = require('cors');
+const express   = require('express');
+const cors      = require('cors');
 const rateLimit = require('express-rate-limit');
-const jwt      = require('jsonwebtoken');
+const jwt       = require('jsonwebtoken');
+const jwksRsa   = require('jwks-rsa');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -30,17 +35,45 @@ const PORT = process.env.PORT || 3001;
 app.set('trust proxy', 1);
 
 // ── Env vars ──────────────────────────────────────────────────────────────────
-const ALLOWED_ORIGIN      = process.env.ALLOWED_ORIGIN      || '';
-const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET || '';
-const SUPABASE_URL        = process.env.SUPABASE_URL        || '';
-const ORG_API_KEY         = process.env.ANTHROPIC_API_KEY   || ''; // optional shared key
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '';
+const SUPABASE_URL   = process.env.SUPABASE_URL   || '';
+const ORG_API_KEY    = process.env.ANTHROPIC_API_KEY || ''; // optional shared key
 
 // Warn on startup if critical env vars are missing
-if (!SUPABASE_JWT_SECRET) console.warn('[WARN] SUPABASE_JWT_SECRET not set — JWT verification will fail');
-if (!ALLOWED_ORIGIN)      console.warn('[WARN] ALLOWED_ORIGIN not set — all origins will be blocked');
+if (!SUPABASE_URL)    console.warn('[WARN] SUPABASE_URL not set — JWT verification will fail');
+if (!ALLOWED_ORIGIN)  console.warn('[WARN] ALLOWED_ORIGIN not set — all origins will be blocked');
+
+// ── JWKS client ───────────────────────────────────────────────────────────────
+// Verifies Supabase JWTs signed with ECC P-256 (ES256) via the JWKS endpoint.
+// Keys are lazy-loaded on first verification request — not at startup.
+// Cache: 5 min TTL, background refresh every 10 min.
+// Timeout: 5s per JWKS fetch — prevents hanging on cold start.
+const jwksClient = SUPABASE_URL ? jwksRsa({
+  jwksUri:              SUPABASE_URL + '/auth/v1/.well-known/jwks.json',
+  cache:                true,
+  cacheMaxAge:          5 * 60 * 1000,   // 5 minutes
+  rateLimit:            true,
+  jwksRequestsPerMinute: 10,
+  requestHeaders:       { 'Accept': 'application/json' },
+  timeout:              5000             // 5s JWKS fetch timeout
+}) : null;
+
+// ── getSigningKey — callback for jwt.verify ───────────────────────────────────
+function getSigningKey(header, callback) {
+  if (!jwksClient) {
+    return callback(new Error('JWKS client not initialised — SUPABASE_URL missing'));
+  }
+  jwksClient.getSigningKey(header.kid, function(err, key) {
+    if (err) {
+      console.warn('[AUTH] JWKS key fetch failed:', err.message);
+      return callback(err);
+    }
+    const signingKey = key.getPublicKey();
+    callback(null, signingKey);
+  });
+}
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
-// Single allowed origin from env var + local dev origins.
 const LOCAL_ORIGINS = [
   'http://localhost',
   'http://127.0.0.1',
@@ -86,11 +119,11 @@ app.use('/api/anthropic', limiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'product-diagnostics-proxy', version: '2.0.0' });
+  res.json({ status: 'ok', service: 'product-diagnostics-proxy', version: '2.1.0' });
 });
 
 // ── JWT auth middleware ───────────────────────────────────────────────────────
-// Verifies Supabase JWT from X-Auth-Token header.
+// Verifies Supabase JWT (ES256 / ECC P-256) from X-Auth-Token header via JWKS.
 // Local dev (localhost / file://) bypasses JWT check — dev convenience only.
 // All hosted requests must carry a valid token.
 function requireAuth(req, res, next) {
@@ -116,8 +149,8 @@ function requireAuth(req, res, next) {
     });
   }
 
-  if (!SUPABASE_JWT_SECRET) {
-    console.error('[AUTH] SUPABASE_JWT_SECRET not configured');
+  if (!jwksClient) {
+    console.error('[AUTH] JWKS client not initialised — SUPABASE_URL missing');
     return res.status(200).json({
       error: {
         type: 'auth_error',
@@ -126,20 +159,21 @@ function requireAuth(req, res, next) {
     });
   }
 
-  try {
-    const decoded = jwt.verify(token, SUPABASE_JWT_SECRET);
+  // Async callback-based verify — required for JWKS key retrieval
+  jwt.verify(token, getSigningKey, { algorithms: ['ES256', 'RS256'] }, function(err, decoded) {
+    if (err) {
+      console.warn('[AUTH] JWT verification failed:', err.message);
+      return res.status(200).json({
+        error: {
+          type: 'auth_error',
+          message: 'Session expired or invalid. Please sign in again.'
+        }
+      });
+    }
     req.user = { id: decoded.sub, email: decoded.email };
     console.log('[AUTH] JWT verified for:', req.user.email);
     return next();
-  } catch (err) {
-    console.warn('[AUTH] JWT verification failed:', err.message);
-    return res.status(200).json({
-      error: {
-        type: 'auth_error',
-        message: 'Session expired or invalid. Please sign in again.'
-      }
-    });
-  }
+  });
 }
 
 app.use('/api/anthropic', requireAuth);
@@ -250,7 +284,7 @@ app.listen(PORT, () => {
   console.log('');
   console.log('  ✓ Product Diagnostics Proxy running');
   console.log('  → Endpoint: http://localhost:' + PORT + '/api/anthropic');
-  console.log('  → Auth:     JWT verification ' + (SUPABASE_JWT_SECRET ? 'ENABLED' : 'DISABLED — set SUPABASE_JWT_SECRET'));
+  console.log('  → Auth:     JWT verification ' + (SUPABASE_URL ? 'ENABLED (JWKS / ECC P-256)' : 'DISABLED — set SUPABASE_URL'));
   console.log('  → API key:  ' + (ORG_API_KEY ? 'Shared org key (env var)' : 'BYOK only'));
   console.log('');
 });
