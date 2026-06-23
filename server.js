@@ -80,7 +80,7 @@ const LOCAL_ORIGINS = [
   'null' // file:// origin (local open-in-browser)
 ];
 
-app.use(cors({
+const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true); // curl, Postman, server-to-server
     if (
@@ -91,11 +91,21 @@ app.use(cors({
     ) {
       return callback(null, true);
     }
+    console.warn('[CORS] Origin blocked:', origin, '— Allowed:', ALLOWED_ORIGIN || '(none set)');
     return callback(new Error('CORS: origin not allowed — ' + origin));
   },
   methods: ['POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Auth-Token']
-}));
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Auth-Token'],
+  optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+
+// Explicit OPTIONS preflight handler — guarantees CORS headers are set before
+// rate limiter or auth middleware can intercept the preflight request.
+// app.use(cors()) handles preflight globally, but this makes /api/anthropic
+// deterministic regardless of future middleware order changes.
+app.options('/api/anthropic', cors(corsOptions));
 
 // ── Body parser ───────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '2mb' }));
@@ -127,15 +137,24 @@ app.get('/', (req, res) => {
 // Local dev (localhost / file://) bypasses JWT check — dev convenience only.
 // All hosted requests must carry a valid token.
 function requireAuth(req, res, next) {
+  // OPTIONS preflight must never require JWT — CORS middleware handles it.
+  // This guard makes auth robust if middleware order ever changes.
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
+
   const origin = req.headers['origin'] || '';
-  const isLocal = !origin ||
+  // Local dev bypass: explicit localhost/127.0.0.1/file:// origins only.
+  // No-Origin requests on a hosted Render service are NOT local dev —
+  // removing !origin closes the JWT bypass security gap.
+  const isLocal =
     origin.startsWith('http://localhost') ||
     origin.startsWith('http://127.0.0.1') ||
     origin === 'null';
 
-  // Bypass JWT for local dev
+  // Bypass JWT for local dev only
   if (isLocal) {
-    console.log('[AUTH] Local dev — JWT check bypassed');
+    console.log('[AUTH] Local dev — JWT check bypassed for origin:', origin || '(none)');
     return next();
   }
 
@@ -220,7 +239,6 @@ app.post('/api/anthropic', async (req, res) => {
         port: 443,
         path: '/v1/messages',
         method: 'POST',
-        rejectUnauthorized: false,
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(postBody),
