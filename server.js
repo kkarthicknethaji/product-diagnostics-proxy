@@ -1,21 +1,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Product Growth Toolkit — Anthropic Proxy
-// Render.com deployment — Phase 1 (Auth + BYOK)
+// Render.com deployment — Phase 1 (Auth + BYOK + Org Key)
 //
 // Responsibilities:
 //   - Receive POST /api/anthropic from browser (Netlify frontend)
 //   - Verify Supabase JWT from X-Auth-Token header using JWKS (ES256 / ECC P-256)
 //   - Forward to Anthropic server-side (no CORS restrictions, no timeout)
-//   - API key priority: ANTHROPIC_API_KEY env var (shared org key) → user BYOK key fallback
+//   - API key priority: user BYOK key → ANTHROPIC_API_KEY env var (org key fallback)
 //   - Returns structured JSON errors — never raw HTML
-//   - Rate limit: 20 req/min per IP
+//   - Rate limit: RATE_LIMIT_MAX req/min per IP
 //
 // Required env vars (set in Render dashboard):
-//   ALLOWED_ORIGIN    — single origin allowed e.g. https://devproductdiagnostics.netlify.app
-//   SUPABASE_URL      — from Supabase project → Settings → API → Project URL
-//                       e.g. https://enozfttaoxhomesdonrc.supabase.co
-//                       JWKS endpoint derived automatically: SUPABASE_URL/auth/v1/.well-known/jwks.json
-//   ANTHROPIC_API_KEY — optional shared org key; if unset, falls back to user BYOK key
+//   ALLOWED_ORIGIN        — single origin allowed e.g. https://productdiagnostics.netlify.app
+//   SUPABASE_URL          — from Supabase project → Settings → API → Project URL
+//                           JWKS endpoint derived automatically: SUPABASE_URL/auth/v1/.well-known/jwks.json
+//   ANTHROPIC_API_KEY     — optional shared org key; if unset, requires user BYOK key
 //
 // Removed env vars (no longer needed — Supabase migrated from HS256 to ECC P-256):
 //   SUPABASE_JWT_SECRET — delete from Render dashboard; JWKS verification replaces it
@@ -33,6 +32,11 @@ const PORT = process.env.PORT || 3001;
 // Trust Render's load balancer so express-rate-limit reads the real client IP
 // from X-Forwarded-For instead of the proxy IP. Fixes rate-limit log warning.
 app.set('trust proxy', 1);
+
+// ── Rate limit config ─────────────────────────────────────────────────────────
+// Centralised so the error message always matches the configured limit.
+const RATE_LIMIT_MAX        = 100; // requests per window per IP
+const RATE_LIMIT_WINDOW_MIN = 1;   // window size in minutes
 
 // ── Env vars ──────────────────────────────────────────────────────────────────
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '';
@@ -112,15 +116,15 @@ app.use(express.json({ limit: '2mb' }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
+  windowMs: RATE_LIMIT_WINDOW_MIN * 60 * 1000,
+  max: RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req, res) => {
     res.status(200).json({
       error: {
         type: 'rate_limit_error',
-        message: 'Too many requests — limit is 20 per minute. Please wait and try again.'
+        message: `Too many requests — limit is ${RATE_LIMIT_MAX} per ${RATE_LIMIT_WINDOW_MIN === 1 ? 'minute' : RATE_LIMIT_WINDOW_MIN + ' minutes'}. Please wait and try again.`
       }
     });
   }
@@ -129,7 +133,7 @@ app.use('/api/anthropic', limiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'product-diagnostics-proxy', version: '2.1.0' });
+  res.json({ status: 'ok', service: 'product-diagnostics-proxy', version: '2.2.0' });
 });
 
 // ── JWT auth middleware ───────────────────────────────────────────────────────
@@ -201,19 +205,19 @@ app.use('/api/anthropic', requireAuth);
 app.post('/api/anthropic', async (req, res) => {
   try {
     // ── API key resolution ──
-    // Priority 1: shared org key from env var (set in Render — users don't need their own key)
-    // Priority 2: BYOK key from Authorization: Bearer header
-    let apiKey = ORG_API_KEY;
-    if (!apiKey) {
-      const authHeader = req.headers['authorization'] || '';
-      apiKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    }
+    // Priority 1: BYOK key from Authorization: Bearer header (user-supplied)
+    // Priority 2: shared org key from ANTHROPIC_API_KEY env var (Render dashboard)
+    // If user supplies a BYOK key, it is always used — org key is never a silent fallback
+    // for an invalid BYOK. Invalid BYOK → Anthropic returns auth error → surfaces to user.
+    const authHeader = req.headers['authorization'] || '';
+    const byokKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    let apiKey = byokKey || ORG_API_KEY;
 
     if (!apiKey) {
       return res.status(200).json({
         error: {
           type: 'auth_error',
-          message: 'No API key available. Enter your Anthropic API key in Settings.'
+          message: 'No API key available. Add a personal API key in Settings or contact your admin.'
         }
       });
     }
