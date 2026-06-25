@@ -236,8 +236,15 @@ app.post('/api/anthropic', async (req, res) => {
     // ── Forward to Anthropic ──
     const https = require('https');
     const postBody = JSON.stringify(body);
+    const bodyBytes = Buffer.byteLength(postBody, 'utf8');
+
+    console.log('[AI OUT]', { model: body.model, max_tokens: body.max_tokens, bodyBytes });
+
+    const UPSTREAM_TIMEOUT_MS = 90000;
 
     const data = await new Promise((resolve, reject) => {
+      let upstreamTimedOut = false;
+
       const options = {
         hostname: 'api.anthropic.com',
         port: 443,
@@ -245,7 +252,7 @@ app.post('/api/anthropic', async (req, res) => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(postBody),
+          'Content-Length': bodyBytes,
           'x-api-key': apiKey,
           'anthropic-version': '2023-06-01'
         }
@@ -253,8 +260,14 @@ app.post('/api/anthropic', async (req, res) => {
 
       const proxyReq = https.request(options, (anthropicRes) => {
         let raw = '';
+        console.log('[AI RESPONSE START]', { statusCode: anthropicRes.statusCode });
         anthropicRes.on('data', chunk => { raw += chunk; });
         anthropicRes.on('end', () => {
+          clearTimeout(upstreamTimer);
+          console.log('[AI RESPONSE END]', {
+            statusCode: anthropicRes.statusCode,
+            responseBytes: Buffer.byteLength(raw, 'utf8')
+          });
           try {
             const parsed = JSON.parse(raw);
             if (anthropicRes.statusCode === 403) {
@@ -273,7 +286,18 @@ app.post('/api/anthropic', async (req, res) => {
         });
       });
 
-      proxyReq.on('error', (e) => reject(e));
+      const upstreamTimer = setTimeout(() => {
+        upstreamTimedOut = true;
+        console.error('[AI TIMEOUT]', { timeoutMs: UPSTREAM_TIMEOUT_MS, model: body.model, max_tokens: body.max_tokens });
+        proxyReq.destroy(new Error('Anthropic upstream timeout after ' + UPSTREAM_TIMEOUT_MS + 'ms'));
+      }, UPSTREAM_TIMEOUT_MS);
+
+      proxyReq.on('error', (e) => {
+        clearTimeout(upstreamTimer);
+        console.error('[AI ERROR]', { message: e.message, timeout: upstreamTimedOut });
+        reject(e);
+      });
+
       proxyReq.write(postBody);
       proxyReq.end();
     });
@@ -281,13 +305,19 @@ app.post('/api/anthropic', async (req, res) => {
     return res.status(200).json(data);
 
   } catch (err) {
+    const isTimeout = err.message && err.message.includes('upstream timeout');
     console.error('[PROXY] Error:', err.message);
-    return res.status(200).json({
-      error: {
-        type: 'proxy_error',
-        message: 'Proxy could not reach Anthropic. Check your network or try again. Detail: ' + err.message
-      }
-    });
+    if (!res.headersSent) {
+      return res.status(isTimeout ? 504 : 502).json({
+        error: {
+          type: isTimeout ? 'timeout_error' : 'proxy_error',
+          message: isTimeout
+            ? 'AI request timed out. The model took too long to respond — please try again.'
+            : 'Proxy could not reach Anthropic. Check your network or try again. Detail: ' + err.message
+        }
+      });
+    }
+    try { res.end(); } catch (_) {}
   }
 });
 
