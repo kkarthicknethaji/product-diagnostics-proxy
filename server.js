@@ -235,10 +235,17 @@ app.post('/api/anthropic', async (req, res) => {
 
     // ── Forward to Anthropic ──
     const https = require('https');
-    const postBody = JSON.stringify(body);
+    const _caller = body._caller || 'unknown';
+    const anthropicBody = {
+      model:      body.model,
+      max_tokens: body.max_tokens,
+      system:     body.system,
+      messages:   body.messages
+    };
+    const postBody = JSON.stringify(anthropicBody);
     const bodyBytes = Buffer.byteLength(postBody, 'utf8');
 
-    console.log('[AI OUT]', { model: body.model, max_tokens: body.max_tokens, bodyBytes });
+    console.log('[AI OUT]', { caller: _caller, model: body.model, max_tokens: body.max_tokens, bodyBytes });
 
     const UPSTREAM_TIMEOUT_MS = 90000;
 
@@ -288,13 +295,13 @@ app.post('/api/anthropic', async (req, res) => {
 
       const upstreamTimer = setTimeout(() => {
         upstreamTimedOut = true;
-        console.error('[AI TIMEOUT]', { timeoutMs: UPSTREAM_TIMEOUT_MS, model: body.model, max_tokens: body.max_tokens });
+        console.error('[AI TIMEOUT]', { caller: _caller, timeoutMs: UPSTREAM_TIMEOUT_MS, model: body.model, max_tokens: body.max_tokens });
         proxyReq.destroy(new Error('Anthropic upstream timeout after ' + UPSTREAM_TIMEOUT_MS + 'ms'));
       }, UPSTREAM_TIMEOUT_MS);
 
       proxyReq.on('error', (e) => {
         clearTimeout(upstreamTimer);
-        console.error('[AI ERROR]', { message: e.message, timeout: upstreamTimedOut });
+        console.error('[AI ERROR]', { caller: _caller, message: e.message, timeout: upstreamTimedOut });
         reject(e);
       });
 
