@@ -111,9 +111,6 @@ app.use(cors(corsOptions));
 // deterministic regardless of future middleware order changes.
 app.options('/api/anthropic', cors(corsOptions));
 
-// ── Body parser ───────────────────────────────────────────────────────────────
-app.use(express.json({ limit: '2mb' }));
-
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
   windowMs: RATE_LIMIT_WINDOW_MIN * 60 * 1000,
@@ -200,6 +197,13 @@ function requireAuth(req, res, next) {
 }
 
 app.use('/api/anthropic', requireAuth);
+
+// ── Body parser — scoped to /api/anthropic only, after auth ──────────────────
+// 10mb limit accommodates base64-encoded screenshot payloads (max 1.5MB file = ~2MB base64).
+// Scoped: health check and 404 routes do not inherit large body parsing.
+// Order: limiter → requireAuth → body parser → handler.
+// Unauthenticated requests are rejected before body is parsed.
+app.use('/api/anthropic', express.json({ limit: '10mb' }));
 
 // ── Main proxy endpoint ───────────────────────────────────────────────────────
 app.post('/api/anthropic', async (req, res) => {
