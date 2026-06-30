@@ -251,7 +251,7 @@ app.post('/api/anthropic', async (req, res) => {
 
     console.log('[AI OUT]', { caller: _caller, model: body.model, max_tokens: body.max_tokens, bodyBytes });
 
-    const UPSTREAM_TIMEOUT_MS = 90000;
+    const UPSTREAM_TIMEOUT_MS = 120000;
 
     const data = await new Promise((resolve, reject) => {
       let upstreamTimedOut = false;
