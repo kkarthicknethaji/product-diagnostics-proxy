@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Product Growth Toolkit — Anthropic Proxy
+// AI PM Toolkit — Anthropic Proxy
 // Render.com deployment — Phase 1 (Auth + BYOK + Org Key)
 //
 // Responsibilities:
@@ -25,6 +25,7 @@ const cors      = require('cors');
 const rateLimit = require('express-rate-limit');
 const jwt       = require('jsonwebtoken');
 const jwksRsa   = require('jwks-rsa');
+const { createClient } = require('@supabase/supabase-js');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -42,10 +43,23 @@ const RATE_LIMIT_WINDOW_MIN = 1;   // window size in minutes
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '';
 const SUPABASE_URL   = process.env.SUPABASE_URL   || '';
 const ORG_API_KEY    = process.env.ANTHROPIC_API_KEY || ''; // optional shared key
+// New for Phase 1 — required for /api/check-company-name (and Phase 4's admin
+// routes later). This is the first time this proxy talks to the Supabase
+// database directly rather than only verifying JWTs; @supabase/supabase-js
+// is a new dependency as of this change, it wasn't needed before.
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 // Warn on startup if critical env vars are missing
 if (!SUPABASE_URL)    console.warn('[WARN] SUPABASE_URL not set — JWT verification will fail');
 if (!ALLOWED_ORIGIN)  console.warn('[WARN] ALLOWED_ORIGIN not set — all origins will be blocked');
+if (!SUPABASE_SERVICE_ROLE_KEY) console.warn('[WARN] SUPABASE_SERVICE_ROLE_KEY not set — /api/check-company-name and admin routes will fail');
+
+// Admin client — bypasses RLS by design, used only for the narrow set of
+// server-side operations that need it (pre-auth company name checks here;
+// invite/disable/delete in Phase 4). Never exposed to the browser.
+const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+  : null;
 
 // ── JWKS client ───────────────────────────────────────────────────────────────
 // Verifies Supabase JWTs signed with ECC P-256 (ES256) via the JWKS endpoint.
@@ -110,6 +124,7 @@ app.use(cors(corsOptions));
 // app.use(cors()) handles preflight globally, but this makes /api/anthropic
 // deterministic regardless of future middleware order changes.
 app.options('/api/anthropic', cors(corsOptions));
+app.options('/api/check-company-name', cors(corsOptions));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
@@ -127,6 +142,26 @@ const limiter = rateLimit({
   }
 });
 app.use('/api/anthropic', limiter);
+
+// Separate limiter instance for check-company-name — same config, applied to
+// its own route so the two don't share a counter. This endpoint is
+// unauthenticated by design (called before signup exists), so rate limiting
+// is the only real abuse guard on it.
+const companyNameLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MIN * 60 * 1000,
+  max: RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(200).json({
+      error: {
+        type: 'rate_limit_error',
+        message: `Too many requests — limit is ${RATE_LIMIT_MAX} per ${RATE_LIMIT_WINDOW_MIN === 1 ? 'minute' : RATE_LIMIT_WINDOW_MIN + ' minutes'}. Please wait and try again.`
+      }
+    });
+  }
+});
+app.use('/api/check-company-name', companyNameLimiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -251,7 +286,10 @@ app.post('/api/anthropic', async (req, res) => {
 
     console.log('[AI OUT]', { caller: _caller, model: body.model, max_tokens: body.max_tokens, bodyBytes });
 
-    const UPSTREAM_TIMEOUT_MS = 120000;
+    // v8.98: per-caller timeout — raising PI's ceiling should not tie up the
+    // proxy longer for every other (smaller, faster) caller if THEY hang.
+    const TIMEOUT_BY_CALLER = { 'pi-generate': 150000 };
+    const UPSTREAM_TIMEOUT_MS = TIMEOUT_BY_CALLER[_caller] || 120000;
 
     const data = await new Promise((resolve, reject) => {
       let upstreamTimedOut = false;
@@ -329,6 +367,42 @@ app.post('/api/anthropic', async (req, res) => {
       });
     }
     try { res.end(); } catch (_) {}
+  }
+});
+
+// ── Check Company Name (Phase 1) ─────────────────────────────────────────────
+// Unauthenticated by design — called before signup exists, so there's no JWT
+// to verify yet. Uses the admin client to bypass RLS (mt_companies' SELECT
+// policy requires active membership, which an unauthenticated caller never
+// has). Rate-limited above; no JWT check on this route.
+app.use('/api/check-company-name', express.json({ limit: '10kb' }));
+app.post('/api/check-company-name', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      console.error('[CHECK-COMPANY] supabaseAdmin not initialised — SUPABASE_SERVICE_ROLE_KEY missing');
+      return res.status(200).json({ exists: false, error: 'Server not configured for this check.' });
+    }
+    const name = (req.body && req.body.name || '').trim();
+    if (!name) {
+      return res.status(200).json({ exists: false });
+    }
+    // Case-insensitive exact match, trimmed on both sides (input trimmed
+    // above; ilike handles case, the stored name was trimmed at creation
+    // time by create_company_with_admin()).
+    const { data, error } = await supabaseAdmin
+      .from('mt_companies')
+      .select('id')
+      .ilike('name', name)
+      .limit(1);
+
+    if (error) {
+      console.warn('[CHECK-COMPANY] query failed:', error.message);
+      return res.status(200).json({ exists: false, error: 'Check failed — proceeding as no match.' });
+    }
+    return res.status(200).json({ exists: !!(data && data.length > 0) });
+  } catch (err) {
+    console.error('[CHECK-COMPANY] exception:', err.message);
+    return res.status(200).json({ exists: false, error: 'Check failed — proceeding as no match.' });
   }
 });
 
