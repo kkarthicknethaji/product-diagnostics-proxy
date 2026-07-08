@@ -184,77 +184,21 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'product-diagnostics-proxy', version: '2.2.0' });
 });
 
-// ── JWT auth middleware ───────────────────────────────────────────────────────
-// Verifies Supabase JWT (ES256 / ECC P-256) from X-Auth-Token header via JWKS.
-// Local dev (localhost / file://) bypasses JWT check — dev convenience only.
-// All hosted requests must carry a valid token.
-function requireAuth(req, res, next) {
-  // OPTIONS preflight must never require JWT — CORS middleware handles it.
-  // This guard makes auth robust if middleware order ever changes.
-  if (req.method === 'OPTIONS') {
-    return next();
-  }
-
-  const origin = req.headers['origin'] || '';
-  // Local dev bypass: explicit localhost/127.0.0.1/file:// origins only.
-  // No-Origin requests on a hosted Render service are NOT local dev —
-  // removing !origin closes the JWT bypass security gap.
-  const isLocal =
-    origin.startsWith('http://localhost') ||
-    origin.startsWith('http://127.0.0.1') ||
-    origin === 'null';
-
-  // Bypass JWT for local dev only
-  if (isLocal) {
-    console.log('[AUTH] Local dev — JWT check bypassed for origin:', origin || '(none)');
-    return next();
-  }
-
-  const token = req.headers['x-auth-token'] || '';
-  if (!token) {
-    return res.status(200).json({
-      error: {
-        type: 'auth_error',
-        message: 'Not authenticated. Please sign in and try again.'
-      }
-    });
-  }
-
-  if (!jwksClient) {
-    console.error('[AUTH] JWKS client not initialised — SUPABASE_URL missing');
-    return res.status(200).json({
-      error: {
-        type: 'auth_error',
-        message: 'Auth not configured on proxy. Contact your administrator.'
-      }
-    });
-  }
-
-  // Async callback-based verify — required for JWKS key retrieval
-  jwt.verify(token, getSigningKey, { algorithms: ['ES256', 'RS256'] }, function(err, decoded) {
-    if (err) {
-      console.warn('[AUTH] JWT verification failed:', err.message);
-      return res.status(200).json({
-        error: {
-          type: 'auth_error',
-          message: 'Session expired or invalid. Please sign in again.'
-        }
-      });
-    }
-    req.user = { id: decoded.sub, email: decoded.email };
-    console.log('[AUTH] JWT verified for:', req.user.email);
-    return next();
-  });
-}
-
-app.use('/api/anthropic', requireAuth);
-
-// ── Strict JWT auth — Phase 4 team routes ─────────────────────────────────────
-// requireAuth's local-dev bypass (isLocal) sets no req.user at all — harmless
-// for /api/anthropic (never reads req.user), but every /api/team/* route needs
-// req.user.id for its authorization check. This variant never bypasses JWT
-// verification regardless of origin, so local-dev testing of Team Management
-// goes through the hosted dev proxy, not localhost:3001.
+// ── Strict JWT auth ────────────────────────────────────────────────────────
+// v8.113: /api/anthropic now uses this too, replacing the old requireAuth
+// (deleted — no other caller remained once this switched). requireAuth's
+// local-dev bypass set no req.user at all, which was harmless when nothing
+// downstream read it, but /api/anthropic now needs req.user.id for its new
+// company-membership check, same reason Team Management needed this variant.
+// Local-dev testing of AI generation now goes through the hosted dev proxy,
+// same as Team Management already required.
+//
+// v8.113: added explicit issuer/audience checks — a real gap in the original
+// implementation, not just new-code hygiene. Signature-only verification
+// doesn't confirm the token came from THIS Supabase project specifically,
+// or that it's a normal user session token rather than some other token
+// type carrying a validly-signed but semantically wrong payload.
+const SUPABASE_ISSUER = SUPABASE_URL ? (SUPABASE_URL + '/auth/v1') : '';
 function requireAuthStrict(req, res, next) {
   if (req.method === 'OPTIONS') return next();
 
@@ -266,7 +210,11 @@ function requireAuthStrict(req, res, next) {
     console.error('[AUTH] JWKS client not initialised — SUPABASE_URL missing');
     return res.status(200).json({ error: { type: 'auth_error', message: 'Auth not configured on proxy. Contact your administrator.' } });
   }
-  jwt.verify(token, getSigningKey, { algorithms: ['ES256', 'RS256'] }, function(err, decoded) {
+  jwt.verify(token, getSigningKey, {
+    algorithms: ['ES256', 'RS256'],
+    issuer: SUPABASE_ISSUER || undefined,
+    audience: 'authenticated'
+  }, function(err, decoded) {
     if (err) {
       console.warn('[AUTH] JWT verification failed (strict):', err.message);
       return res.status(200).json({ error: { type: 'auth_error', message: 'Session expired or invalid. Please sign in again.' } });
@@ -275,6 +223,8 @@ function requireAuthStrict(req, res, next) {
     next();
   });
 }
+
+app.use('/api/anthropic', requireAuthStrict);
 
 // ── Team Management — CORS preflight, rate limit, body parser ────────────────
 app.options('/api/team/*', cors(corsOptions));
@@ -333,9 +283,43 @@ app.use('/api/team', requireCompanyAdmin);
 // ── Body parser — scoped to /api/anthropic only, after auth ──────────────────
 // 10mb limit accommodates base64-encoded screenshot payloads (max 1.5MB file = ~2MB base64).
 // Scoped: health check and 404 routes do not inherit large body parsing.
-// Order: limiter → requireAuth → body parser → handler.
+// Order: limiter → requireAuthStrict → body parser → requireActiveCompanyMember → handler.
 // Unauthenticated requests are rejected before body is parsed.
 app.use('/api/anthropic', express.json({ limit: '10mb' }));
+
+// ── Company-membership check (v8.113) ─────────────────────────────────────────
+// requireAuthStrict proves WHO is calling; this proves they're currently an
+// active member of the company they claim to be generating for — previously
+// missing entirely on this endpoint, the highest-frequency one in the app.
+// Calls the same is_active_company_member() RPC the Netlify function's
+// equivalent check also calls, so the two implementations can't drift apart
+// on what "active member" actually means.
+async function requireActiveCompanyMember(req, res, next) {
+  if (req.method === 'OPTIONS') return next();
+  const companyId = req.body && req.body.company_id;
+  if (!companyId) {
+    return res.status(200).json({ error: { type: 'invalid_request', message: 'company_id is required.' } });
+  }
+  try {
+    const { data: isMember, error } = await supabaseAdmin.rpc('is_active_company_member', {
+      p_user_id: req.user.id, p_company_id: companyId
+    });
+    if (error) {
+      console.error('[AI] membership check failed:', error.message);
+      return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not verify company access. Please try again.' } });
+    }
+    if (!isMember) {
+      console.warn('[AI] membership denied:', req.user.email, '->', companyId);
+      return res.status(200).json({ error: { type: 'forbidden_error', message: "You don't have active access to this company." } });
+    }
+    delete req.body.company_id; // single source of truth from here on, same pattern as requireCompanyAdmin
+    next();
+  } catch (err) {
+    console.error('[AI] membership check exception:', err.message);
+    return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not verify company access. Please try again.' } });
+  }
+}
+app.use('/api/anthropic', requireActiveCompanyMember);
 
 // ── Main proxy endpoint ───────────────────────────────────────────────────────
 app.post('/api/anthropic', async (req, res) => {
