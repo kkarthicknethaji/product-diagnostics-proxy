@@ -55,8 +55,39 @@ const SUPABASE_URL   = process.env.SUPABASE_URL   || '';
 const INVITE_REDIRECT_ALLOWLIST = (process.env.INVITE_REDIRECT_ALLOWLIST || '')
   .split(',')
   .map(function(s){ return s.trim(); })
+  .filter(Boolean)
+  // Normalized to a canonical origin (protocol+host+port, no trailing
+  // slash/path) via the URL constructor — closes a real config-fragility
+  // risk (a trailing slash typo in the env var silently never matching
+  // anything) without weakening the exact-match security property at all;
+  // it's still exact match, just against a canonical form on both sides.
+  .map(function(s){
+    try { return new URL(s).origin; }
+    catch(e) { console.warn('[WARN] invalid INVITE_REDIRECT_ALLOWLIST entry, ignoring:', s); return ''; }
+  })
   .filter(Boolean);
 const INVITE_REDIRECT_PATH = '/login.html';
+
+// Shared by /api/team/invite and /api/team/resend — returns ONLY the
+// resolved redirect URL string (or undefined), never a method-specific
+// options shape. inviteUserByEmail() and generateLink() take redirectTo
+// at genuinely different nesting levels (confirmed against the actual
+// shipped @supabase/auth-js types, not assumed) — a helper that tried to
+// return a ready-made options object for one of them would silently be
+// wrong for the other. Each call site applies this value using its own
+// real API shape.
+function _resolveInviteRedirect(req) {
+  const rawOrigin = req.headers.origin || '';
+  if (!rawOrigin) return undefined;
+  let requestOrigin;
+  try { requestOrigin = new URL(rawOrigin).origin; }
+  catch(e) { console.warn('[TEAM] invalid request origin, omitting redirectTo:', rawOrigin); return undefined; }
+  if (INVITE_REDIRECT_ALLOWLIST.includes(requestOrigin)) {
+    return requestOrigin + INVITE_REDIRECT_PATH;
+  }
+  console.warn('[TEAM] origin not in INVITE_REDIRECT_ALLOWLIST, omitting redirectTo:', requestOrigin);
+  return undefined;
+}
 const ORG_API_KEY    = process.env.ANTHROPIC_API_KEY || ''; // optional shared key
 // New for Phase 1 — required for /api/check-company-name (and Phase 4's admin
 // routes later). This is the first time this proxy talks to the Supabase
@@ -600,16 +631,12 @@ app.post('/api/team/invite', async (req, res) => {
 
     // redirectTo: reads the browser-enforced Origin header directly — never a
     // client-supplied field, which would just be a second value to spoof and
-    // validate against the first. Exact match only against the allow-list;
-    // no match means no redirectTo at all, falling back to Supabase's own
-    // configured Site URL default rather than erroring the whole invite.
-    const requestOrigin = req.headers.origin || '';
+    // validate against the first. No match means no redirectTo at all,
+    // falling back to Supabase's own configured Site URL default rather
+    // than erroring the whole invite.
     const inviteOptions = { data: Object.keys(inviteMetadata).length ? inviteMetadata : undefined };
-    if (INVITE_REDIRECT_ALLOWLIST.includes(requestOrigin)) {
-      inviteOptions.redirectTo = requestOrigin + INVITE_REDIRECT_PATH;
-    } else if (requestOrigin) {
-      console.warn('[TEAM] invite: origin not in INVITE_REDIRECT_ALLOWLIST, omitting redirectTo:', requestOrigin);
-    }
+    const redirectTo = _resolveInviteRedirect(req);
+    if (redirectTo) inviteOptions.redirectTo = redirectTo; // top-level — inviteUserByEmail's real shape
 
     const inviteResult = await supabaseAdmin.auth.admin.inviteUserByEmail(email, inviteOptions);
 
@@ -779,18 +806,32 @@ app.post('/api/team/delete', async (req, res) => {
     }
 
     if (!resolution) {
-      // Step 1: report shared-session count, no mutation yet.
-      const { count, error } = await supabaseAdmin
+      // Step 1: report both shared and private session counts, no mutation yet.
+      // Private count is disclosed here too (v8.114) — Delete now actually
+      // deletes private sessions, not just orphans them, so the confirm UI
+      // needs to tell the admin how many sessions are about to be permanently
+      // lost, not just show a generic "can't be undone."
+      const { count: sharedCount, error: sharedErr } = await supabaseAdmin
         .from('mt_sessions')
         .select('id', { count: 'exact', head: true })
         .eq('user_id', targetUserId)
         .eq('company_id', req.companyId)
         .eq('is_shared', true);
-      if (error) {
-        console.error('[TEAM] delete: shared-session count failed:', error.message);
+      if (sharedErr) {
+        console.error('[TEAM] delete: shared-session count failed:', sharedErr.message);
         return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not check shared sessions. Please try again.' } });
       }
-      return res.status(200).json({ shared_session_count: count || 0 });
+      const { count: privateCount, error: privateErr } = await supabaseAdmin
+        .from('mt_sessions')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', targetUserId)
+        .eq('company_id', req.companyId)
+        .eq('is_shared', false);
+      if (privateErr) {
+        console.error('[TEAM] delete: private-session count failed:', privateErr.message);
+        return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not check sessions. Please try again.' } });
+      }
+      return res.status(200).json({ shared_session_count: sharedCount || 0, private_session_count: privateCount || 0 });
     }
 
     // Step 2: execute.
@@ -832,7 +873,21 @@ app.post('/api/team/delete', async (req, res) => {
         .eq('is_shared', true);
       if (sessDelErr) console.warn('[TEAM] delete: session delete failed:', sessDelErr.message);
     }
-    // resolution === 'retain' -> no further session mutation beyond the lock clear above.
+    // resolution === 'retain' -> no further mutation on shared sessions beyond the lock clear above.
+
+    // Private sessions are always deleted outright (v8.114) — reversed from the
+    // original "leave untouched" design once cross-checked against Disable,
+    // which already fully covers the "maybe they're coming back" reversible
+    // case with less friction than delete+reinvite. Delete is free to be the
+    // genuinely destructive option. No lock-clearing needed first — the row
+    // is being removed entirely, not retained in a modified state.
+    const { error: privateDelErr } = await supabaseAdmin
+      .from('mt_sessions')
+      .delete()
+      .eq('user_id', targetUserId)
+      .eq('company_id', req.companyId)
+      .eq('is_shared', false);
+    if (privateDelErr) console.warn('[TEAM] delete: private session delete failed:', privateDelErr.message);
 
     console.log('[TEAM] delete:', req.user.email, '-> removed', targetUserId, 'resolution', resolution, 'company', req.companyId);
     return res.status(200).json({ ok: true });
@@ -870,10 +925,10 @@ app.post('/api/team/resend', async (req, res) => {
     if (userData.user.last_sign_in_at) {
       return res.status(200).json({ error: { type: 'invalid_request', message: 'This person has already signed in — nothing to resend.' } });
     }
-    const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink({
-      type: 'invite',
-      email: userData.user.email
-    });
+    const linkParams = { type: 'invite', email: userData.user.email };
+    const redirectTo = _resolveInviteRedirect(req);
+    if (redirectTo) linkParams.options = { redirectTo }; // nested under options — generateLink's real shape, confirmed against the shipped @supabase/auth-js types (top-level redirectTo would be silently ignored)
+    const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink(linkParams);
     if (linkErr || !linkData) {
       console.error('[TEAM] resend: generateLink failed:', linkErr && linkErr.message);
       return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not generate a new invite link. Please try again.' } });
