@@ -400,7 +400,7 @@ app.post('/api/anthropic', async (req, res) => {
 
     // v8.98: per-caller timeout — raising PI's ceiling should not tie up the
     // proxy longer for every other (smaller, faster) caller if THEY hang.
-    const TIMEOUT_BY_CALLER = { 'pi-generate': 150000 };
+    const TIMEOUT_BY_CALLER = { 'pi-generate': 150000, 'mi-docx-gen': 150000 };
     const UPSTREAM_TIMEOUT_MS = TIMEOUT_BY_CALLER[_caller] || 120000;
 
     const data = await new Promise((resolve, reject) => {
@@ -603,7 +603,12 @@ app.post('/api/team/invite', async (req, res) => {
     const rawEmail = (req.body && req.body.email) || '';
     const email = rawEmail.trim().toLowerCase();
     const fullName = (req.body && req.body.full_name || '').trim();
-    const role = (req.body && req.body.role === 'admin') ? 'admin' : 'member';
+    // v9.09 — explicit allowlist covering all 3 roles. Omitted/unrecognized
+    // still defaults to 'member' (Power User) — an invite with no role
+    // specified is normal, unlike set-role below where an invalid value on
+    // an EXISTING member is treated as a hard error, not a silent default.
+    const _validInviteRoles = ['admin', 'member', 'readonly'];
+    const role = (req.body && _validInviteRoles.includes(req.body.role)) ? req.body.role : 'member';
 
     if (!email) {
       return res.status(200).json({ error: { type: 'invalid_request', message: 'Email is required.' } });
@@ -683,11 +688,23 @@ app.post('/api/team/invite', async (req, res) => {
   }
 });
 
-// ── Set role ── Make Admin / Make Regular User
+// ── Set role ── Make Admin / Make Power User / Make Read Only
 app.post('/api/team/set-role', async (req, res) => {
   try {
     const targetUserId = req.body && req.body.target_user_id;
-    const newRole = (req.body && req.body.new_role === 'admin') ? 'admin' : 'member';
+    // v9.09 — HARD FAIL on invalid new_role, not a silent coerce-to-'member'.
+    // This is deliberately different from /api/team/invite's behavior:
+    // an invite with an omitted role defaulting is normal; a set-role
+    // request naming an existing member with a garbled/unrecognized role
+    // string is either a bug or an attack, and silently downgrading it to
+    // 'member' would have granted MORE privilege than requested if the
+    // caller actually meant 'readonly' — the exact landmine found during
+    // adversarial review. Reject outright instead.
+    const _validRoles = ['admin', 'member', 'readonly'];
+    const newRole = req.body && req.body.new_role;
+    if (typeof newRole !== 'string' || !_validRoles.includes(newRole)) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'Invalid role specified.' } });
+    }
     if (!targetUserId) {
       return res.status(200).json({ error: { type: 'invalid_request', message: 'target_user_id is required.' } });
     }
@@ -856,24 +873,55 @@ app.post('/api/team/delete', async (req, res) => {
       .eq('company_id', req.companyId)
       .eq('is_shared', true);
 
+    // v9.12 — same cleanup for the separate occupancy lock (Session
+    // Occupancy Lock / "Single User Editing" mode). Flagged during
+    // adversarial review: without this, a removed member's still-
+    // authenticated browser could keep refreshing occupant_at via
+    // heartbeat_session_occupancy indefinitely, since that RPC only checks
+    // occupant_user_id = current_app_user() and lease freshness — it has no
+    // independent membership check of its own, by design (matching
+    // acquire_generation_lock's own heartbeat, which relies on this exact
+    // same admin-cleanup pattern rather than re-checking membership on
+    // every 22-second tick).
+    await supabaseAdmin
+      .from('mt_sessions')
+      .update({ occupant_user_id: null, occupant_at: null, occupant_user_name: null })
+      .eq('user_id', targetUserId)
+      .eq('company_id', req.companyId)
+      .eq('is_shared', true);
+
+    let affectedCount = 0;
     if (resolution === 'reassign') {
-      const { error: reassignErr } = await supabaseAdmin
+      // Phase 5: .select('id') added so the response can echo the REAL
+      // affected count back to the client toast, rather than the client
+      // re-displaying the step-1 count it fetched a few seconds earlier —
+      // which could theoretically have drifted if something else changed
+      // a session's is_shared/ownership in between the two calls.
+      const { data: reassignedRows, error: reassignErr } = await supabaseAdmin
         .from('mt_sessions')
         .update({ user_id: req.user.id })
         .eq('user_id', targetUserId)
         .eq('company_id', req.companyId)
-        .eq('is_shared', true);
+        .eq('is_shared', true)
+        .select('id');
       if (reassignErr) console.warn('[TEAM] delete: reassign failed:', reassignErr.message);
+      else affectedCount = (reassignedRows || []).length;
     } else if (resolution === 'delete_sessions') {
-      const { error: sessDelErr } = await supabaseAdmin
+      const { data: deletedRows, error: sessDelErr } = await supabaseAdmin
         .from('mt_sessions')
         .delete()
         .eq('user_id', targetUserId)
         .eq('company_id', req.companyId)
-        .eq('is_shared', true);
+        .eq('is_shared', true)
+        .select('id');
       if (sessDelErr) console.warn('[TEAM] delete: session delete failed:', sessDelErr.message);
+      else affectedCount = (deletedRows || []).length;
     }
-    // resolution === 'retain' -> no further mutation on shared sessions beyond the lock clear above.
+    // Phase 5: any other resolution value (e.g. 'no_shared_sessions', the
+    // client's own no-op marker for the zero-shared-sessions path) ->
+    // no further mutation on shared sessions beyond the lock clear above,
+    // affectedCount stays 0. Retain as a concept is fully removed — see
+    // team-management.js's _tmShowSharedSessionChoice for why.
 
     // Private sessions are always deleted outright (v8.114) — reversed from the
     // original "leave untouched" design once cross-checked against Disable,
@@ -890,7 +938,7 @@ app.post('/api/team/delete', async (req, res) => {
     if (privateDelErr) console.warn('[TEAM] delete: private session delete failed:', privateDelErr.message);
 
     console.log('[TEAM] delete:', req.user.email, '-> removed', targetUserId, 'resolution', resolution, 'company', req.companyId);
-    return res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true, affected_count: affectedCount });
   } catch (err) {
     console.error('[TEAM] delete exception:', err.message);
     return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not remove member. Please try again.' } });
