@@ -433,12 +433,37 @@ app.post('/api/anthropic', async (req, res) => {
     // from auth/membership checks that already ran before this point.
     const _requestStartedAt = new Date();
     const _clientCallId = body.client_call_id || null;
-    const _productId    = body.product_id || null;
     const _sessionId    = body.session_id || null;
     const _settingsMode  = body.settings_mode || null;
     const _settingsModel = body.settings_model || null;
     const _selectionRule = body.selection_rule || null;
     const _promptVersion = body.prompt_version || null;
+
+    // v9.13.01: product_id is now derived server-side from session_id ->
+    // mt_sessions.product_id, NOT trusted from the client's body.product_id
+    // (activeProfileId on the frontend). Confirmed via real production data
+    // that activeProfileId — a Home-tab-scoped UI variable — can be null at
+    // generation time even mid-session with a genuine active product,
+    // producing silent NULL product_id rows in mt_ai_usage_events. Since
+    // mt_sessions.product_id is now NOT NULL (every session is launched
+    // against exactly one product, enforced at both the UI and DB layer),
+    // this lookup is authoritative whenever a session_id is present. The
+    // client-sent body.product_id is kept ONLY as a fallback for the rare
+    // caller with no session at all (e.g. doc-summary on a company-level
+    // document) — never overriding a real session's own value.
+    let _productId = body.product_id || null;
+    if (_sessionId) {
+      try {
+        const { data: _sessRow } = await supabaseAdmin
+          .from('mt_sessions')
+          .select('product_id')
+          .eq('id', _sessionId)
+          .maybeSingle();
+        if (_sessRow && _sessRow.product_id) _productId = _sessRow.product_id;
+      } catch (e) {
+        console.warn('[AI USAGE] session product_id lookup failed:', e.message);
+      }
+    }
 
     // Role snapshot at call time — deliberately a SEPARATE small query, not
     // squeezed out of requireActiveCompanyMember's is_active_company_member()
