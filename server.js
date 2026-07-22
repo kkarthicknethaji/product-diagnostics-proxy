@@ -108,6 +108,27 @@ const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
   : null;
 
+// ── AI usage-tracking insert helper (v9.13) ──────────────────────────────────
+// Writes one row to mt_ai_usage_events per /api/anthropic call, on BOTH the
+// success/response-received path and the error/timeout path (two call sites
+// below use this same helper — see the main handler). Awaited, not fire-and-
+// forget: an un-awaited insert on a long-running Express process is usually
+// safe, but not safe against Render replacing/restarting this instance mid-
+// request, which would silently drop the row with no way to know it happened.
+// Awaiting costs a little latency per call but guarantees the row exists (or
+// its failure is at least logged) before the response is sent.
+// Never throws — a usage-tracking failure must never surface to the user as
+// an AI-generation failure, so any error here is caught and logged only.
+async function _insertAiUsageEvent(fields) {
+  if (!supabaseAdmin) return; // telemetry is best-effort; never block on missing config
+  try {
+    const { error } = await supabaseAdmin.from('mt_ai_usage_events').insert(fields);
+    if (error) console.error('[AI USAGE] insert failed:', error.message);
+  } catch (e) {
+    console.error('[AI USAGE] insert exception:', e.message);
+  }
+}
+
 // ── JWKS client ───────────────────────────────────────────────────────────────
 // Verifies Supabase JWTs signed with ECC P-256 (ES256) via the JWKS endpoint.
 // Keys are lazy-loaded on first verification request — not at startup.
@@ -343,6 +364,11 @@ async function requireActiveCompanyMember(req, res, next) {
       console.warn('[AI] membership denied:', req.user.email, '->', companyId);
       return res.status(200).json({ error: { type: 'forbidden_error', message: "You don't have active access to this company." } });
     }
+    // v9.13: preserved on req (not just deleted from body) so the AI usage-
+    // tracking insert further down the handler has a trusted, server-verified
+    // company_id to record against — mirrors requireCompanyAdmin's existing
+    // req.companyId pattern below, previously only used by /api/team/*.
+    req.companyId = companyId;
     delete req.body.company_id; // single source of truth from here on, same pattern as requireCompanyAdmin
     next();
   } catch (err) {
@@ -398,12 +424,49 @@ app.post('/api/anthropic', async (req, res) => {
 
     console.log('[AI OUT]', { caller: _caller, model: body.model, max_tokens: body.max_tokens, bodyBytes });
 
+    // ── AI usage-tracking (v9.13) ──
+    // Fields read off the ORIGINAL request body (never anthropicBody above,
+    // which is deliberately narrowed to only what Anthropic itself needs —
+    // these fields must never be forwarded upstream). Marked started here,
+    // before the outbound call begins, so duration_ms and the pricing-lookup
+    // timestamp both reflect the actual Anthropic call, not proxy overhead
+    // from auth/membership checks that already ran before this point.
+    const _requestStartedAt = new Date();
+    const _clientCallId = body.client_call_id || null;
+    const _productId    = body.product_id || null;
+    const _sessionId    = body.session_id || null;
+    const _settingsMode  = body.settings_mode || null;
+    const _settingsModel = body.settings_model || null;
+    const _selectionRule = body.selection_rule || null;
+    const _promptVersion = body.prompt_version || null;
+
+    // Role snapshot at call time — deliberately a SEPARATE small query, not
+    // squeezed out of requireActiveCompanyMember's is_active_company_member()
+    // RPC above, which returns a plain boolean and has no role to give.
+    // Modifying that RPC's return shape would be a security-definer-function
+    // change shared with the (currently dormant) Netlify proxy path and
+    // deserves its own scrutiny — out of scope for a telemetry addition.
+    // Snapshotting here means later role changes never retroactively alter
+    // what this historical row says the caller's role was at the time.
+    let _userRoleAtCall = null;
+    try {
+      const { data: _roleRow } = await supabaseAdmin
+        .from('mt_users_companies')
+        .select('role')
+        .eq('user_id', req.user.id)
+        .eq('company_id', req.companyId)
+        .maybeSingle();
+      _userRoleAtCall = _roleRow ? _roleRow.role : null;
+    } catch (e) {
+      console.warn('[AI USAGE] role snapshot failed:', e.message);
+    }
+
     // v8.98: per-caller timeout — raising PI's ceiling should not tie up the
     // proxy longer for every other (smaller, faster) caller if THEY hang.
     const TIMEOUT_BY_CALLER = { 'pi-generate': 150000, 'mi-docx-gen': 150000 };
     const UPSTREAM_TIMEOUT_MS = TIMEOUT_BY_CALLER[_caller] || 120000;
 
-    const data = await new Promise((resolve, reject) => {
+    const _result = await new Promise((resolve, reject) => {
       let upstreamTimedOut = false;
 
       const options = {
@@ -425,21 +488,32 @@ app.post('/api/anthropic', async (req, res) => {
         anthropicRes.on('data', chunk => { raw += chunk; });
         anthropicRes.on('end', () => {
           clearTimeout(upstreamTimer);
+          const _responseBytes = Buffer.byteLength(raw, 'utf8');
           console.log('[AI RESPONSE END]', {
             statusCode: anthropicRes.statusCode,
-            responseBytes: Buffer.byteLength(raw, 'utf8')
+            responseBytes: _responseBytes
           });
           try {
             const parsed = JSON.parse(raw);
+            // v9.13: resolve() now returns an envelope (data + responseBytes +
+            // httpStatus) instead of the bare parsed body — needed so the AI
+            // usage-tracking insert below has the real response size and
+            // HTTP status, neither of which was previously threaded out of
+            // this promise. Everything downstream that consumes `data` is
+            // unaffected; only the immediate unwrap at the await site changes.
             if (anthropicRes.statusCode === 403) {
               resolve({
-                error: {
-                  type: 'permission_error',
-                  message: 'Your API key is blocked from server-side access. Check your Anthropic org policy settings, or use a personal API key.'
-                }
+                data: {
+                  error: {
+                    type: 'permission_error',
+                    message: 'Your API key is blocked from server-side access. Check your Anthropic org policy settings, or use a personal API key.'
+                  }
+                },
+                responseBytes: _responseBytes,
+                httpStatus: anthropicRes.statusCode
               });
             } else {
-              resolve(parsed);
+              resolve({ data: parsed, responseBytes: _responseBytes, httpStatus: anthropicRes.statusCode });
             }
           } catch (e) {
             reject(new Error('Failed to parse Anthropic response: ' + e.message));
@@ -463,11 +537,98 @@ app.post('/api/anthropic', async (req, res) => {
       proxyReq.end();
     });
 
+    const { data, responseBytes, httpStatus } = _result;
+    const _durationMs = Date.now() - _requestStartedAt.getTime();
+
+    // ── AI usage-tracking insert — success/response-received path (v9.13) ──
+    // "Success" here means a response was actually received from Anthropic,
+    // which may itself carry an error payload (e.g. overloaded_error) — that
+    // still counts as status='error' with a real duration/response size,
+    // distinct from the outer catch block below, which only fires when NO
+    // response was ever received at all (network failure, timeout).
+    const _isErrorPayload = !!(data && data.error);
+    await _insertAiUsageEvent({
+      client_call_id: _clientCallId,
+      provider: 'anthropic',
+      company_id: req.companyId,
+      product_id: _productId,
+      session_id: _sessionId,
+      user_id: req.user.id,
+      user_role_at_call: _userRoleAtCall,
+      caller: _caller,
+      prompt_version: _promptVersion,
+      requested_model: body.model,
+      response_model: (data && data.model) || null,
+      settings_mode: _settingsMode,
+      settings_model: _settingsModel,
+      selection_rule: _selectionRule,
+      input_tokens: (data && data.usage) ? data.usage.input_tokens : null,
+      output_tokens: (data && data.usage) ? data.usage.output_tokens : null,
+      cache_creation_5m_tokens: (data && data.usage && data.usage.cache_creation) ? data.usage.cache_creation.ephemeral_5m_input_tokens : null,
+      cache_creation_1h_tokens: (data && data.usage && data.usage.cache_creation) ? data.usage.cache_creation.ephemeral_1h_input_tokens : null,
+      cache_read_tokens: (data && data.usage) ? data.usage.cache_read_input_tokens : null,
+      provider_usage_raw: (data && data.usage) ? data.usage : null,
+      status: _isErrorPayload ? 'error' : 'success',
+      provider_http_status: httpStatus,
+      error_type: _isErrorPayload ? data.error.type : null,
+      failure_phase: _isErrorPayload ? 'outbound_call' : null,
+      request_started_at: _requestStartedAt.toISOString(),
+      duration_ms: _durationMs,
+      request_bytes: bodyBytes,
+      response_bytes: responseBytes
+    });
+
     return res.status(200).json(data);
 
   } catch (err) {
     const isTimeout = err.message && err.message.includes('upstream timeout');
     console.error('[PROXY] Error:', err.message);
+
+    // ── AI usage-tracking insert — error/timeout path (v9.13) ──
+    // This branch fires when NO response was ever received from Anthropic at
+    // all (network failure, timeout, or a thrown parse error) — distinct from
+    // the success-path branch above, which handles a received-but-error-
+    // payload response. token/model/response fields are genuinely unavailable
+    // here, left null rather than defaulted to 0 (a real "we don't know," not
+    // a false "this cost nothing"). Only fires if the earlier per-call setup
+    // (timing, field extraction) completed — an error before that point
+    // (e.g. malformed body caught earlier in this handler) never reaches
+    // this catch block in the first place, so _requestStartedAt is safe to
+    // reference here.
+    if (typeof _requestStartedAt !== 'undefined') {
+      const _durationMs = Date.now() - _requestStartedAt.getTime();
+      await _insertAiUsageEvent({
+        client_call_id: typeof _clientCallId !== 'undefined' ? _clientCallId : null,
+        provider: 'anthropic',
+        company_id: req.companyId || null,
+        product_id: typeof _productId !== 'undefined' ? _productId : null,
+        session_id: typeof _sessionId !== 'undefined' ? _sessionId : null,
+        user_id: req.user ? req.user.id : null,
+        user_role_at_call: typeof _userRoleAtCall !== 'undefined' ? _userRoleAtCall : null,
+        caller: typeof _caller !== 'undefined' ? _caller : 'unknown',
+        prompt_version: typeof _promptVersion !== 'undefined' ? _promptVersion : null,
+        requested_model: (body && body.model) || null,
+        response_model: null,
+        settings_mode: typeof _settingsMode !== 'undefined' ? _settingsMode : null,
+        settings_model: typeof _settingsModel !== 'undefined' ? _settingsModel : null,
+        selection_rule: typeof _selectionRule !== 'undefined' ? _selectionRule : null,
+        input_tokens: null,
+        output_tokens: null,
+        cache_creation_5m_tokens: null,
+        cache_creation_1h_tokens: null,
+        cache_read_tokens: null,
+        provider_usage_raw: null,
+        status: isTimeout ? 'timeout' : 'error',
+        provider_http_status: null,
+        error_type: isTimeout ? 'timeout_error' : 'proxy_error',
+        failure_phase: 'outbound_call',
+        request_started_at: _requestStartedAt.toISOString(),
+        duration_ms: _durationMs,
+        request_bytes: typeof bodyBytes !== 'undefined' ? bodyBytes : null,
+        response_bytes: null
+      });
+    }
+
     if (!res.headersSent) {
       return res.status(isTimeout ? 504 : 502).json({
         error: {
