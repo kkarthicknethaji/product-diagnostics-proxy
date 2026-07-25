@@ -1,12 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// AI PM Toolkit — Anthropic Proxy
-// Render.com deployment — Phase 1 (Auth + BYOK + Org Key)
+// AI PM Toolkit — Multi-Provider AI Proxy (v9.14 — was Anthropic-only)
+// Render.com deployment
 //
 // Responsibilities:
 //   - Receive POST /api/anthropic from browser (Netlify frontend)
 //   - Verify Supabase JWT from X-Auth-Token header using JWKS (ES256 / ECC P-256)
-//   - Forward to Anthropic server-side (no CORS restrictions, no timeout)
-//   - API key priority: user BYOK key → ANTHROPIC_API_KEY env var (org key fallback)
+//   - Resolve the company's ACTUAL configured provider server-side (never
+//     trust the client-sent `provider` field for dispatch/billing/usage —
+//     see requireActiveCompanyMember + _resolveCompanyProvider below)
+//   - Forward to the resolved provider (Anthropic, OpenAI, or Gemini — see
+//     proxy/providerAdapters.js) via its adapter
+//   - API key priority per provider: user BYOK key → org env var fallback
 //   - Returns structured JSON errors — never raw HTML
 //   - Rate limit: RATE_LIMIT_MAX req/min per IP
 //
@@ -15,6 +19,8 @@
 //   SUPABASE_URL          — from Supabase project → Settings → API → Project URL
 //                           JWKS endpoint derived automatically: SUPABASE_URL/auth/v1/.well-known/jwks.json
 //   ANTHROPIC_API_KEY     — optional shared org key; if unset, requires user BYOK key
+//   OPENAI_API_KEY        — optional shared org key for OpenAI; same fallback role as ANTHROPIC_API_KEY
+//   GEMINI_API_KEY        — optional shared org key for Gemini; same fallback role as ANTHROPIC_API_KEY
 //
 // Removed env vars (no longer needed — Supabase migrated from HS256 to ECC P-256):
 //   SUPABASE_JWT_SECRET — delete from Render dashboard; JWKS verification replaces it
@@ -26,6 +32,7 @@ const rateLimit = require('express-rate-limit');
 const jwt       = require('jsonwebtoken');
 const jwksRsa   = require('jwks-rsa');
 const { createClient } = require('@supabase/supabase-js');
+const { getAdapter, isKnownModel } = require('./providerAdapters');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -88,7 +95,13 @@ function _resolveInviteRedirect(req) {
   console.warn('[TEAM] origin not in INVITE_REDIRECT_ALLOWLIST, omitting redirectTo:', requestOrigin);
   return undefined;
 }
-const ORG_API_KEY    = process.env.ANTHROPIC_API_KEY || ''; // optional shared key
+// v9.14: same fallback role each provider's own env var plays — replaces the
+// old single ORG_API_KEY (Anthropic-only) constant.
+const ORG_API_KEY_BY_PROVIDER = {
+  anthropic: process.env.ANTHROPIC_API_KEY || '',
+  openai:    process.env.OPENAI_API_KEY || '',
+  gemini:    process.env.GEMINI_API_KEY || ''
+};
 // New for Phase 1 — required for /api/check-company-name (and Phase 4's admin
 // routes later). This is the first time this proxy talks to the Supabase
 // database directly rather than only verifying JWTs; @supabase/supabase-js
@@ -370,6 +383,35 @@ async function requireActiveCompanyMember(req, res, next) {
     // req.companyId pattern below, previously only used by /api/team/*.
     req.companyId = companyId;
     delete req.body.company_id; // single source of truth from here on, same pattern as requireCompanyAdmin
+
+    // v9.14: server-authoritative provider resolution. The proxy does NOT
+    // trust body.provider for dispatch/billing/usage-attribution — a
+    // manipulated provider field could route a request (and its cost) to a
+    // different platform-owned org key than the company's actual configured
+    // choice, a materially different risk than anything in the app before
+    // this feature. Read directly from mt_company_settings, the same store
+    // the client itself reads/writes (settings-page.js's
+    // _spSaveCompanySettings()) — alongside the membership check already
+    // just performed above. A missing/unreadable row defaults to
+    // 'anthropic', matching appSettings.provider's own client-side default
+    // for a company that predates this feature (never existed in a row yet).
+    try {
+      const { data: settingsRow, error: settingsErr } = await supabaseAdmin
+        .from('mt_company_settings')
+        .select('settings')
+        .eq('company_id', companyId)
+        .maybeSingle();
+      if (settingsErr) {
+        console.warn('[AI] provider resolution: mt_company_settings query failed, defaulting to anthropic:', settingsErr.message);
+        req.resolvedProvider = 'anthropic';
+      } else {
+        req.resolvedProvider = (settingsRow && settingsRow.settings && settingsRow.settings.provider) || 'anthropic';
+      }
+    } catch (e) {
+      console.warn('[AI] provider resolution exception, defaulting to anthropic:', e.message);
+      req.resolvedProvider = 'anthropic';
+    }
+
     next();
   } catch (err) {
     console.error('[AI] membership check exception:', err.message);
@@ -378,17 +420,81 @@ async function requireActiveCompanyMember(req, res, next) {
 }
 app.use('/api/anthropic', requireActiveCompanyMember);
 
+// ── Generic provider HTTP call (v9.14) ──────────────────────────────────────
+// Replaces the old Anthropic-only inline https.request() block. Same
+// Promise/timeout/error shape as before, just parameterized by the adapter's
+// buildUpstreamRequest() output instead of a hardcoded hostname/path.
+function _callUpstream(upstreamReq, timeoutMs, onTimeoutLog) {
+  const https = require('https');
+  const url = new URL(upstreamReq.url);
+  const postBody = JSON.stringify(upstreamReq.body);
+  const bodyBytes = Buffer.byteLength(postBody, 'utf8');
+
+  return new Promise((resolve, reject) => {
+    let upstreamTimedOut = false;
+    const options = {
+      hostname: url.hostname,
+      port: 443,
+      path: url.pathname + url.search,
+      method: upstreamReq.method || 'POST',
+      headers: Object.assign({ 'Content-Length': bodyBytes }, upstreamReq.headers)
+    };
+
+    const proxyReq = https.request(options, (upstreamRes) => {
+      let raw = '';
+      upstreamRes.on('data', chunk => { raw += chunk; });
+      upstreamRes.on('end', () => {
+        clearTimeout(upstreamTimer);
+        const _responseBytes = Buffer.byteLength(raw, 'utf8');
+        try {
+          const parsed = JSON.parse(raw);
+          resolve({ data: parsed, responseBytes: _responseBytes, httpStatus: upstreamRes.statusCode, requestBytes: bodyBytes });
+        } catch (e) {
+          reject(new Error('Failed to parse upstream response: ' + e.message));
+        }
+      });
+    });
+
+    const upstreamTimer = setTimeout(() => {
+      upstreamTimedOut = true;
+      if (onTimeoutLog) onTimeoutLog();
+      proxyReq.destroy(new Error('Upstream timeout after ' + timeoutMs + 'ms'));
+    }, timeoutMs);
+
+    proxyReq.on('error', (e) => {
+      clearTimeout(upstreamTimer);
+      reject(e);
+    });
+
+    proxyReq.write(postBody);
+    proxyReq.end();
+  });
+}
+
 // ── Main proxy endpoint ───────────────────────────────────────────────────────
 app.post('/api/anthropic', async (req, res) => {
   try {
+    // v9.14: provider is resolved server-side by requireActiveCompanyMember
+    // above (req.resolvedProvider) — NEVER taken from body.provider, which
+    // the client may send for diagnostics only (see scripts/api.js's
+    // callAPI()). This is the single source of truth for which adapter runs,
+    // which env var/BYOK-header key gets used, and what gets logged to
+    // mt_ai_usage_events.provider.
+    const provider = req.resolvedProvider || 'anthropic';
+    const adapter = getAdapter(provider);
+    if (!adapter) {
+      console.error('[AI] no adapter for resolved provider:', provider);
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'This company\'s configured AI provider is not currently supported.' } });
+    }
+
     // ── API key resolution ──
     // Priority 1: BYOK key from Authorization: Bearer header (user-supplied)
-    // Priority 2: shared org key from ANTHROPIC_API_KEY env var (Render dashboard)
+    // Priority 2: shared org key from the resolved provider's env var (Render dashboard)
     // If user supplies a BYOK key, it is always used — org key is never a silent fallback
-    // for an invalid BYOK. Invalid BYOK → Anthropic returns auth error → surfaces to user.
+    // for an invalid BYOK. Invalid BYOK → provider returns auth error → surfaces to user.
     const authHeader = req.headers['authorization'] || '';
     const byokKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    let apiKey = byokKey || ORG_API_KEY;
+    let apiKey = byokKey || ORG_API_KEY_BY_PROVIDER[provider] || '';
 
     if (!apiKey) {
       return res.status(200).json({
@@ -410,19 +516,29 @@ app.post('/api/anthropic', async (req, res) => {
       });
     }
 
-    // ── Forward to Anthropic ──
-    const https = require('https');
+    // ── Runtime model validation (Section 6.3's fail-fast requirement) ──
+    // Reject an unrecognized model for the resolved provider BEFORE spending
+    // an upstream call on it — a stale client cache or tampered request
+    // sending a model string that was never actually offered for this
+    // provider should surface a clear proxy-side error, not a confusing
+    // upstream one.
+    if (!isKnownModel(provider, body.model)) {
+      console.warn('[AI] rejected unknown model for provider:', provider, body.model);
+      return res.status(200).json({
+        error: { type: 'invalid_request', message: 'Unsupported model for the configured AI provider.' }
+      });
+    }
+
     const _caller = body._caller || 'unknown';
-    const anthropicBody = {
+    const upstreamReq = adapter.buildUpstreamRequest({
       model:      body.model,
       max_tokens: body.max_tokens,
       system:     body.system,
       messages:   body.messages
-    };
-    const postBody = JSON.stringify(anthropicBody);
-    const bodyBytes = Buffer.byteLength(postBody, 'utf8');
+    }, apiKey);
+    const bodyBytesPreview = Buffer.byteLength(JSON.stringify(upstreamReq.body), 'utf8');
 
-    console.log('[AI OUT]', { caller: _caller, model: body.model, max_tokens: body.max_tokens, bodyBytes });
+    console.log('[AI OUT]', { provider, caller: _caller, model: body.model, max_tokens: body.max_tokens, bodyBytes: bodyBytesPreview });
 
     // ── AI usage-tracking (v9.13) ──
     // Fields read off the ORIGINAL request body (never anthropicBody above,
@@ -488,93 +604,66 @@ app.post('/api/anthropic', async (req, res) => {
 
     // v8.98: per-caller timeout — raising PI's ceiling should not tie up the
     // proxy longer for every other (smaller, faster) caller if THEY hang.
+    // v9.14: this remains the single total request deadline per Section 5.5
+    // — a retry below (if any) happens WITHIN one overall attempt cycle, not
+    // as an independent extra timeout window stacked on top.
     const TIMEOUT_BY_CALLER = { 'pi-generate': 150000, 'mi-docx-gen': 150000 };
     const UPSTREAM_TIMEOUT_MS = TIMEOUT_BY_CALLER[_caller] || 120000;
 
-    const _result = await new Promise((resolve, reject) => {
-      let upstreamTimedOut = false;
-
-      const options = {
-        hostname: 'api.anthropic.com',
-        port: 443,
-        path: '/v1/messages',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': bodyBytes,
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01'
-        }
-      };
-
-      const proxyReq = https.request(options, (anthropicRes) => {
-        let raw = '';
-        console.log('[AI RESPONSE START]', { statusCode: anthropicRes.statusCode });
-        anthropicRes.on('data', chunk => { raw += chunk; });
-        anthropicRes.on('end', () => {
-          clearTimeout(upstreamTimer);
-          const _responseBytes = Buffer.byteLength(raw, 'utf8');
-          console.log('[AI RESPONSE END]', {
-            statusCode: anthropicRes.statusCode,
-            responseBytes: _responseBytes
-          });
-          try {
-            const parsed = JSON.parse(raw);
-            // v9.13: resolve() now returns an envelope (data + responseBytes +
-            // httpStatus) instead of the bare parsed body — needed so the AI
-            // usage-tracking insert below has the real response size and
-            // HTTP status, neither of which was previously threaded out of
-            // this promise. Everything downstream that consumes `data` is
-            // unaffected; only the immediate unwrap at the await site changes.
-            if (anthropicRes.statusCode === 403) {
-              resolve({
-                data: {
-                  error: {
-                    type: 'permission_error',
-                    message: 'Your API key is blocked from server-side access. Check your Anthropic org policy settings, or use a personal API key.'
-                  }
-                },
-                responseBytes: _responseBytes,
-                httpStatus: anthropicRes.statusCode
-              });
-            } else {
-              resolve({ data: parsed, responseBytes: _responseBytes, httpStatus: anthropicRes.statusCode });
-            }
-          } catch (e) {
-            reject(new Error('Failed to parse Anthropic response: ' + e.message));
-          }
+    // ── Upstream call, with a single bounded retry on transient errors only
+    // (Section 5.5) ──
+    // Retried ONLY when a response was actually received and the adapter
+    // classifies its error as transient (rate-limit/overload/5xx) — never on
+    // invalid-key, permission, malformed-request, or content-safety errors,
+    // and never on a transport-level failure/timeout, where the upstream
+    // call may have already reached the provider and a retry risks a
+    // double-billed duplicate. The client does not layer its own retry on
+    // top of this (see scripts/api.js's callAPI() — single fetch, no retry).
+    let _result;
+    let _attempt = 0;
+    const MAX_ATTEMPTS = 2;
+    while (true) {
+      _attempt++;
+      try {
+        _result = await _callUpstream(upstreamReq, UPSTREAM_TIMEOUT_MS, function(){
+          console.error('[AI TIMEOUT]', { provider, caller: _caller, timeoutMs: UPSTREAM_TIMEOUT_MS, model: body.model, attempt: _attempt });
         });
-      });
+      } catch (transportErr) {
+        // Transport-level failure (network error or our own timeout-forced
+        // destroy) — never retried, per Section 5.5's ambiguous-outcome rule.
+        // Rethrown to the outer catch block, which handles the
+        // no-response-at-all usage-tracking path.
+        throw transportErr;
+      }
+      if (_result.httpStatus >= 200 && _result.httpStatus < 300) break; // success — no retry needed
+      const _errVerdict = adapter.normalizeHttpError(_result.data, _result.httpStatus);
+      if (_errVerdict.retryable && _attempt < MAX_ATTEMPTS) {
+        console.warn('[AI RETRY]', { provider, caller: _caller, httpStatus: _result.httpStatus, normalizedErrorCode: _errVerdict.normalizedErrorCode, attempt: _attempt });
+        await new Promise(function(r){ setTimeout(r, 1000); }); // fixed backoff — neither provider's retry-after field is confirmed yet (see spec Section 7)
+        continue;
+      }
+      break; // not retryable, or out of attempts — fall through with the error response as-is
+    }
 
-      const upstreamTimer = setTimeout(() => {
-        upstreamTimedOut = true;
-        console.error('[AI TIMEOUT]', { caller: _caller, timeoutMs: UPSTREAM_TIMEOUT_MS, model: body.model, max_tokens: body.max_tokens });
-        proxyReq.destroy(new Error('Anthropic upstream timeout after ' + UPSTREAM_TIMEOUT_MS + 'ms'));
-      }, UPSTREAM_TIMEOUT_MS);
-
-      proxyReq.on('error', (e) => {
-        clearTimeout(upstreamTimer);
-        console.error('[AI ERROR]', { caller: _caller, message: e.message, timeout: upstreamTimedOut });
-        reject(e);
-      });
-
-      proxyReq.write(postBody);
-      proxyReq.end();
-    });
-
-    const { data, responseBytes, httpStatus } = _result;
+    const { data, responseBytes, httpStatus, requestBytes } = _result;
+    const bodyBytes = requestBytes;
     const _durationMs = Date.now() - _requestStartedAt.getTime();
 
-    // ── AI usage-tracking insert — success/response-received path (v9.13) ──
-    // "Success" here means a response was actually received from Anthropic,
-    // which may itself carry an error payload (e.g. overloaded_error) — that
-    // still counts as status='error' with a real duration/response size,
-    // distinct from the outer catch block below, which only fires when NO
-    // response was ever received at all (network failure, timeout).
-    const _isErrorPayload = !!(data && data.error);
+    // ── AI usage-tracking insert — success/response-received path (v9.13,
+    // provider-aware v9.14) ──
+    // "Success" here means a response was actually received from the
+    // provider, which may itself carry an error payload (e.g. an overloaded
+    // response) — that still counts as status='error' with a real
+    // duration/response size, distinct from the outer catch block below,
+    // which only fires when NO response was ever received at all (network
+    // failure, timeout).
+    const _isErrorPayload = !(httpStatus >= 200 && httpStatus < 300);
+    const _normalized = _isErrorPayload ? adapter.normalizeHttpError(data, httpStatus) : adapter.normalizeSuccess(data);
+    if (!_isErrorPayload) _normalized.requestedModel = body.model;
+
     await _insertAiUsageEvent({
       client_call_id: _clientCallId,
-      provider: 'anthropic',
+      provider: provider, // server-resolved, never the client-echoed body.provider — see requireActiveCompanyMember above
       company_id: req.companyId,
       product_id: _productId,
       session_id: _sessionId,
@@ -583,19 +672,22 @@ app.post('/api/anthropic', async (req, res) => {
       caller: _caller,
       prompt_version: _promptVersion,
       requested_model: body.model,
-      response_model: (data && data.model) || null,
+      response_model: _isErrorPayload ? null : _normalized.resolvedModel,
       settings_mode: _settingsMode,
       settings_model: _settingsModel,
       selection_rule: _selectionRule,
-      input_tokens: (data && data.usage) ? data.usage.input_tokens : null,
-      output_tokens: (data && data.usage) ? data.usage.output_tokens : null,
-      cache_creation_5m_tokens: (data && data.usage && data.usage.cache_creation) ? data.usage.cache_creation.ephemeral_5m_input_tokens : null,
-      cache_creation_1h_tokens: (data && data.usage && data.usage.cache_creation) ? data.usage.cache_creation.ephemeral_1h_input_tokens : null,
-      cache_read_tokens: (data && data.usage) ? data.usage.cache_read_input_tokens : null,
-      provider_usage_raw: (data && data.usage) ? data.usage : null,
+      input_tokens: _isErrorPayload ? null : _normalized.usage.inputTokens,
+      output_tokens: _isErrorPayload ? null : _normalized.usage.outputTokens,
+      // Anthropic-specific cache fields — remain null for non-Anthropic
+      // providers, whose usage detail (if any) belongs in provider_usage_raw
+      // instead of being force-fit into these Anthropic-shaped columns.
+      cache_creation_5m_tokens: (!_isErrorPayload && provider === 'anthropic' && data.usage && data.usage.cache_creation) ? data.usage.cache_creation.ephemeral_5m_input_tokens : null,
+      cache_creation_1h_tokens: (!_isErrorPayload && provider === 'anthropic' && data.usage && data.usage.cache_creation) ? data.usage.cache_creation.ephemeral_1h_input_tokens : null,
+      cache_read_tokens: (!_isErrorPayload && provider === 'anthropic' && data.usage) ? data.usage.cache_read_input_tokens : null,
+      provider_usage_raw: _isErrorPayload ? null : _normalized.providerUsageRaw,
       status: _isErrorPayload ? 'error' : 'success',
       provider_http_status: httpStatus,
-      error_type: _isErrorPayload ? data.error.type : null,
+      error_type: _isErrorPayload ? _normalized.normalizedErrorCode : null,
       failure_phase: _isErrorPayload ? 'outbound_call' : null,
       request_started_at: _requestStartedAt.toISOString(),
       duration_ms: _durationMs,
@@ -603,10 +695,25 @@ app.post('/api/anthropic', async (req, res) => {
       response_bytes: responseBytes
     });
 
-    return res.status(200).json(data);
+    // v9.14: provider-neutral response envelope (Section 5.4) — the client's
+    // callAPI() now reads data.text, not data.content[0].text. On an error
+    // payload, keep the existing {error:{type,message}} shape the client's
+    // _pgtAnthropicErrorMessage() already knows how to interpret; _rawType
+    // preserves Anthropic's exact original error.type string so that
+    // function's existing per-type prefixes don't regress for Anthropic.
+    if (_isErrorPayload) {
+      return res.status(200).json({
+        error: {
+          type: _normalized._rawType || _normalized.normalizedErrorCode,
+          message: _normalized.safeErrorMessage
+        }
+      });
+    }
+    return res.status(200).json({ text: _normalized.text });
 
   } catch (err) {
-    const isTimeout = err.message && err.message.includes('upstream timeout');
+    const isTimeout = /upstream timeout/i.test(err.message || '');
+    const _errProvider = req.resolvedProvider || 'anthropic';
     console.error('[PROXY] Error:', err.message);
 
     // ── AI usage-tracking insert — error/timeout path (v9.13) ──
@@ -624,7 +731,7 @@ app.post('/api/anthropic', async (req, res) => {
       const _durationMs = Date.now() - _requestStartedAt.getTime();
       await _insertAiUsageEvent({
         client_call_id: typeof _clientCallId !== 'undefined' ? _clientCallId : null,
-        provider: 'anthropic',
+        provider: _errProvider,
         company_id: req.companyId || null,
         product_id: typeof _productId !== 'undefined' ? _productId : null,
         session_id: typeof _sessionId !== 'undefined' ? _sessionId : null,
@@ -660,7 +767,7 @@ app.post('/api/anthropic', async (req, res) => {
           type: isTimeout ? 'timeout_error' : 'proxy_error',
           message: isTimeout
             ? 'AI request timed out. The model took too long to respond — please try again.'
-            : 'Proxy could not reach Anthropic. Check your network or try again. Detail: ' + err.message
+            : 'Proxy could not reach ' + _errProvider + '. Check your network or try again. Detail: ' + err.message
         }
       });
     }
@@ -1229,6 +1336,6 @@ app.listen(PORT, () => {
   console.log('  ✓ Product Diagnostics Proxy running');
   console.log('  → Endpoint: http://localhost:' + PORT + '/api/anthropic');
   console.log('  → Auth:     JWT verification ' + (SUPABASE_URL ? 'ENABLED (JWKS / ECC P-256)' : 'DISABLED — set SUPABASE_URL'));
-  console.log('  → API key:  ' + (ORG_API_KEY ? 'Shared org key (env var)' : 'BYOK only'));
+  console.log('  → API key:  anthropic=' + (ORG_API_KEY_BY_PROVIDER.anthropic ? 'org key set' : 'BYOK only') + ', openai=' + (ORG_API_KEY_BY_PROVIDER.openai ? 'org key set' : 'BYOK only') + ', gemini=' + (ORG_API_KEY_BY_PROVIDER.gemini ? 'org key set' : 'BYOK only'));
   console.log('');
 });
