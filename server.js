@@ -568,7 +568,14 @@ app.post('/api/anthropic', async (req, res) => {
     // caller with no session at all (e.g. doc-summary on a company-level
     // document) — never overriding a real session's own value.
     let _productId = body.product_id || null;
-    if (_sessionId) {
+    // v9.15: session_type is set only by Guided Launch (session_type:'ChatCanvas'),
+    // whose session_id points at mt_intake_sessions, not mt_sessions — the lookup
+    // below would just miss and silently do nothing, but skipping it outright is
+    // the correct behavior, not a fallback: body.product_id is already the real
+    // value in that case (Guided Launch always knows its product directly, no
+    // Discovery Map session exists yet to derive it from).
+    const _sessionType = body.session_type || null;
+    if (_sessionId && !_sessionType) {
       try {
         const { data: _sessRow } = await supabaseAdmin
           .from('mt_sessions')
@@ -667,6 +674,7 @@ app.post('/api/anthropic', async (req, res) => {
       company_id: req.companyId,
       product_id: _productId,
       session_id: _sessionId,
+      session_type: _sessionType,
       user_id: req.user.id,
       user_role_at_call: _userRoleAtCall,
       caller: _caller,
@@ -735,6 +743,7 @@ app.post('/api/anthropic', async (req, res) => {
         company_id: req.companyId || null,
         product_id: typeof _productId !== 'undefined' ? _productId : null,
         session_id: typeof _sessionId !== 'undefined' ? _sessionId : null,
+        session_type: typeof _sessionType !== 'undefined' ? _sessionType : null,
         user_id: req.user ? req.user.id : null,
         user_role_at_call: typeof _userRoleAtCall !== 'undefined' ? _userRoleAtCall : null,
         caller: typeof _caller !== 'undefined' ? _caller : 'unknown',
