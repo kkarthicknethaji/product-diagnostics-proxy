@@ -471,6 +471,200 @@ function _callUpstream(upstreamReq, timeoutMs, onTimeoutLog) {
   });
 }
 
+// ── Streaming upstream call (v-next, Requirement Agent only, opt-in via
+// body.stream — see scripts/requirement-agent.js's _raStreamingEnabled()) ──
+// Mirrors _callUpstream()'s connection/timeout/retry-eligible-error shape
+// EXACTLY up through "did upstream return a 2xx" — this is what keeps the
+// existing retry-once-on-transient-error logic meaningful for streaming
+// calls too: retry decisions are still made before a single byte reaches the
+// client. Only once upstream confirms 2xx does this diverge from
+// _callUpstream() — instead of buffering the full body, it forwards each
+// provider SSE event, translated by adapter.parseSSEEvent() into a
+// normalized {delta, usage} shape, to the client as this proxy's OWN (much
+// simpler) SSE contract: `data: {"delta":"..."}` per chunk, ending with
+// `data: {"done":true}` (or `data: {"error":true,"message":"..."}` if the
+// upstream connection drops mid-stream — no retry is possible at that point,
+// same limitation any streaming client has).
+function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog) {
+  const https = require('https');
+  const { StringDecoder } = require('string_decoder');
+  const url = new URL(upstreamReq.url);
+  const postBody = JSON.stringify(upstreamReq.body);
+  const bodyBytes = Buffer.byteLength(postBody, 'utf8');
+
+  return new Promise((resolve, reject) => {
+    let upstreamTimedOut = false;
+    const options = {
+      hostname: url.hostname,
+      port: 443,
+      path: url.pathname + url.search,
+      method: upstreamReq.method || 'POST',
+      headers: Object.assign({ 'Content-Length': bodyBytes }, upstreamReq.headers)
+    };
+
+    const proxyReq = https.request(options, (upstreamRes) => {
+      clearTimeout(upstreamTimer);
+
+      if (upstreamRes.statusCode < 200 || upstreamRes.statusCode >= 300) {
+        // Never stream an error payload — buffer it exactly like _callUpstream
+        // so the existing retry-once logic can inspect it as usual.
+        let raw = '';
+        upstreamRes.on('data', chunk => { raw += chunk; });
+        upstreamRes.on('end', () => {
+          let parsed = null;
+          try { parsed = JSON.parse(raw); } catch (e) { /* leave null — adapter.normalizeHttpError tolerates this */ }
+          resolve({ streamed: false, data: parsed, httpStatus: upstreamRes.statusCode, requestBytes: bodyBytes, responseBytes: Buffer.byteLength(raw, 'utf8') });
+        });
+        return;
+      }
+
+      // Upstream confirmed 2xx — begin forwarding to the client as a stream.
+      // No more retry possible past this point, matching the plan's
+      // documented tradeoff.
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      let sseBuffer = '';
+      let responseBytes = 0;
+      const usage = { inputTokens: null, outputTokens: null, totalTokens: null, providerUsageRaw: null, resolvedModel: null };
+      // StringDecoder (Node core), not Buffer#toString('utf8') per chunk —
+      // a multi-byte UTF-8 character split across two TCP chunks would
+      // otherwise decode independently in each chunk and come out as a
+      // replacement character (U+FFFD) instead of being reassembled.
+      // StringDecoder carries incomplete trailing bytes over to the next
+      // .write() call, same guarantee scripts/api.js's client-side
+      // TextDecoder(..., {stream:true}) already provides.
+      const decoder = new StringDecoder('utf8');
+
+      upstreamRes.on('data', (chunk) => {
+        responseBytes += chunk.length;
+        sseBuffer += decoder.write(chunk);
+        const events = sseBuffer.split('\n\n');
+        sseBuffer = events.pop(); // last entry may be a partial event — keep buffering it
+        events.forEach((evt) => {
+          if (!evt.trim()) return;
+          let parsedEvt;
+          try { parsedEvt = adapter.parseSSEEvent(evt); } catch (e) { parsedEvt = { delta: null, usage: null, done: false }; }
+          if (parsedEvt.delta) {
+            try { res.write('data: ' + JSON.stringify({ delta: parsedEvt.delta }) + '\n\n'); } catch (e) {}
+          }
+          if (parsedEvt.usage) {
+            if (parsedEvt.usage.inputTokens != null) usage.inputTokens = parsedEvt.usage.inputTokens;
+            if (parsedEvt.usage.outputTokens != null) usage.outputTokens = parsedEvt.usage.outputTokens;
+            if (parsedEvt.usage.totalTokens != null) usage.totalTokens = parsedEvt.usage.totalTokens;
+            if (parsedEvt.usage.providerUsageRaw != null) usage.providerUsageRaw = parsedEvt.usage.providerUsageRaw;
+          }
+          if (parsedEvt.resolvedModel != null) usage.resolvedModel = parsedEvt.resolvedModel;
+        });
+      });
+
+      upstreamRes.on('end', () => {
+        try { res.write('data: ' + JSON.stringify({ done: true }) + '\n\n'); res.end(); } catch (e) {}
+        resolve({ streamed: true, usage, requestBytes: bodyBytes, responseBytes });
+      });
+    });
+
+    const upstreamTimer = setTimeout(() => {
+      upstreamTimedOut = true;
+      if (onTimeoutLog) onTimeoutLog();
+      proxyReq.destroy(new Error('Upstream timeout after ' + timeoutMs + 'ms'));
+    }, timeoutMs);
+
+    proxyReq.on('error', (err) => {
+      clearTimeout(upstreamTimer);
+      if (res.headersSent) {
+        // Streaming had already begun to the client — end it with an error
+        // marker. No retry possible at this point (mirrors the non-streaming
+        // path's own rule: a request that may have already reached the
+        // provider is not safely retryable).
+        try {
+          res.write('data: ' + JSON.stringify({ error: true, message: upstreamTimedOut ? 'Upstream timed out mid-stream.' : ('Stream interrupted: ' + (err.message || 'unknown error')) }) + '\n\n');
+          res.end();
+        } catch (e) {}
+        resolve({ streamed: true, usage: { inputTokens: null, outputTokens: null, totalTokens: null, providerUsageRaw: null, resolvedModel: null }, requestBytes: bodyBytes, responseBytes: 0, midStreamError: true });
+      } else {
+        // No response ever received (headers never sent) — a genuine
+        // transport-level failure, same as _callUpstream()'s own
+        // reject(e) above. Rejecting (not resolving) is what makes
+        // _handleStreamingRequest's `catch (transportErr) { throw
+        // transportErr; }` actually reachable, so this falls through to
+        // the outer handler's proper timeout/network error path instead
+        // of being misread as an HTTP error with undefined status.
+        reject(err);
+      }
+    });
+
+    proxyReq.write(postBody);
+    proxyReq.end();
+  });
+}
+
+// Full request lifecycle for a streaming call — same retry-once-on-transient-
+// error semantics and same mt_ai_usage_events logging as the non-streaming
+// path below, just restructured around _streamUpstreamOnce()'s
+// {streamed, ...} result shape. Only reached when body.stream is true (opt-in,
+// currently only ever sent by Requirement Agent when its localStorage
+// streaming flag is on — see scripts/requirement-agent.js).
+async function _handleStreamingRequest(req, res, ctx) {
+  const { provider, adapter, upstreamReq, _caller, body, _requestStartedAt, _clientCallId, _sessionId, _sessionType, _productId, _userRoleAtCall, _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS } = ctx;
+  upstreamReq.body.stream = true;
+
+  let _attempt = 0;
+  const MAX_ATTEMPTS = 2;
+  while (true) {
+    _attempt++;
+    let outcome;
+    try {
+      outcome = await _streamUpstreamOnce(upstreamReq, UPSTREAM_TIMEOUT_MS, adapter, res, function () {
+        console.error('[AI TIMEOUT]', { provider, caller: _caller, timeoutMs: UPSTREAM_TIMEOUT_MS, model: body.model, attempt: _attempt, streaming: true });
+      });
+    } catch (transportErr) {
+      throw transportErr; // no response ever received — outer catch handles usage-tracking + client response
+    }
+
+    if (outcome.streamed) {
+      const _durationMs = Date.now() - _requestStartedAt.getTime();
+      await _insertAiUsageEvent({
+        client_call_id: _clientCallId, provider, company_id: req.companyId, product_id: _productId,
+        session_id: _sessionId, session_type: _sessionType, user_id: req.user.id, user_role_at_call: _userRoleAtCall,
+        caller: _caller, prompt_version: _promptVersion, requested_model: body.model, response_model: outcome.usage.resolvedModel,
+        settings_mode: _settingsMode, settings_model: _settingsModel, selection_rule: _selectionRule,
+        input_tokens: outcome.usage.inputTokens, output_tokens: outcome.usage.outputTokens,
+        cache_creation_5m_tokens: null, cache_creation_1h_tokens: null, cache_read_tokens: null,
+        provider_usage_raw: outcome.usage.providerUsageRaw,
+        status: outcome.midStreamError ? 'error' : 'success',
+        provider_http_status: 200,
+        error_type: outcome.midStreamError ? 'stream_interrupted' : null,
+        failure_phase: outcome.midStreamError ? 'outbound_call' : null,
+        request_started_at: _requestStartedAt.toISOString(), duration_ms: _durationMs,
+        request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes
+      });
+      return; // res already ended inside _streamUpstreamOnce
+    }
+
+    // Not streamed: either a pre-stream buffered HTTP error, or (thrown above)
+    // a transport failure. Reaching here means a buffered error response.
+    const _errVerdict = adapter.normalizeHttpError(outcome.data, outcome.httpStatus);
+    if (_errVerdict.retryable && _attempt < MAX_ATTEMPTS) {
+      console.warn('[AI RETRY]', { provider, caller: _caller, httpStatus: outcome.httpStatus, normalizedErrorCode: _errVerdict.normalizedErrorCode, attempt: _attempt, streaming: true });
+      await new Promise(function (r) { setTimeout(r, 1000); });
+      continue;
+    }
+
+    const _durationMs = Date.now() - _requestStartedAt.getTime();
+    await _insertAiUsageEvent({
+      client_call_id: _clientCallId, provider, company_id: req.companyId, product_id: _productId,
+      session_id: _sessionId, session_type: _sessionType, user_id: req.user.id, user_role_at_call: _userRoleAtCall,
+      caller: _caller, prompt_version: _promptVersion, requested_model: body.model, response_model: null,
+      settings_mode: _settingsMode, settings_model: _settingsModel, selection_rule: _selectionRule,
+      input_tokens: null, output_tokens: null, cache_creation_5m_tokens: null, cache_creation_1h_tokens: null, cache_read_tokens: null,
+      provider_usage_raw: null, status: 'error', provider_http_status: outcome.httpStatus,
+      error_type: _errVerdict.normalizedErrorCode, failure_phase: 'outbound_call',
+      request_started_at: _requestStartedAt.toISOString(), duration_ms: _durationMs,
+      request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes
+    });
+    return res.status(200).json({ error: { type: _errVerdict._rawType || _errVerdict.normalizedErrorCode, message: _errVerdict.safeErrorMessage } });
+  }
+}
+
 // ── Main proxy endpoint ───────────────────────────────────────────────────────
 app.post('/api/anthropic', async (req, res) => {
   try {
@@ -616,6 +810,19 @@ app.post('/api/anthropic', async (req, res) => {
     // as an independent extra timeout window stacked on top.
     const TIMEOUT_BY_CALLER = { 'pi-generate': 150000, 'mi-docx-gen': 150000 };
     const UPSTREAM_TIMEOUT_MS = TIMEOUT_BY_CALLER[_caller] || 120000;
+
+    // ── Streaming opt-in (v-next, Requirement Agent only) ──
+    // body.stream is only ever sent true by Requirement Agent, and only when
+    // its own localStorage flag is on (see scripts/requirement-agent.js's
+    // _raStreamingEnabled()) — every other caller's request has no `stream`
+    // field and falls straight through to the unchanged buffered path below.
+    if (body.stream === true) {
+      return await _handleStreamingRequest(req, res, {
+        provider, adapter, upstreamReq, _caller, body, _requestStartedAt,
+        _clientCallId, _sessionId, _sessionType, _productId, _userRoleAtCall,
+        _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS
+      });
+    }
 
     // ── Upstream call, with a single bounded retry on transient errors only
     // (Section 5.5) ──

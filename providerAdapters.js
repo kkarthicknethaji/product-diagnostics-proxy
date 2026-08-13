@@ -164,6 +164,45 @@ const anthropicAdapter = {
         ? 'AI request timed out. The model took too long to respond — please try again.'
         : 'Proxy could not reach Anthropic. Check your network or try again.'
     };
+  },
+
+  // v-next (Requirement Agent streaming, opt-in via body.stream — see
+  // server.js's _handleStreamingRequest). Anthropic's Messages API SSE
+  // format is well-documented and stable: named `event:`/`data:` pairs
+  // separated by a blank line. Confidence: HIGH — standard, long-stable
+  // wire format, unlike OpenAI/Gemini's adapters below.
+  // Takes one raw SSE event block (everything between two blank lines) and
+  // returns {delta, usage, done, resolvedModel} — never throws, a malformed/
+  // unrecognized event just yields all-null/false so the caller keeps
+  // streaming. usage.providerUsageRaw carries the exact upstream usage
+  // object (cache tokens etc.) through untouched, same as the non-streaming
+  // normalizeSuccess() already does for the buffered path.
+  parseSSEEvent(eventBlock) {
+    let dataLine = null;
+    eventBlock.split('\n').forEach(function(l) {
+      if (l.indexOf('data:') === 0) dataLine = l.slice(5).trim();
+    });
+    if (!dataLine) return { delta: null, usage: null, done: false };
+    let data;
+    try { data = JSON.parse(dataLine); } catch (e) { return { delta: null, usage: null, done: false }; }
+    if (data.type === 'content_block_delta' && data.delta && data.delta.type === 'text_delta') {
+      return { delta: data.delta.text || '', usage: null, done: false };
+    }
+    if (data.type === 'message_start' && data.message) {
+      return {
+        delta: null,
+        usage: data.message.usage ? { inputTokens: data.message.usage.input_tokens != null ? data.message.usage.input_tokens : null, outputTokens: null, totalTokens: null, providerUsageRaw: data.message.usage } : null,
+        done: false,
+        resolvedModel: data.message.model || null
+      };
+    }
+    if (data.type === 'message_delta' && data.usage) {
+      return { delta: null, usage: { inputTokens: null, outputTokens: data.usage.output_tokens != null ? data.usage.output_tokens : null, totalTokens: null, providerUsageRaw: data.usage }, done: false };
+    }
+    if (data.type === 'message_stop') {
+      return { delta: null, usage: null, done: true };
+    }
+    return { delta: null, usage: null, done: false };
   }
 };
 
@@ -252,6 +291,37 @@ const openaiAdapter = {
         ? 'AI request timed out. The model took too long to respond — please try again.'
         : 'Proxy could not reach OpenAI. Check your network or try again.'
     };
+  },
+
+  // v-next (Requirement Agent streaming). [VERIFY] — Responses API SSE event
+  // names/shape (response.output_text.delta / response.completed) are based
+  // on OpenAI's documented streaming pattern, not directly re-confirmed
+  // against live docs the way this file's other OpenAI fields were (see the
+  // confidence-tier note above buildUpstreamRequest). Same defensive shape
+  // as the Anthropic adapter's parseSSEEvent — an unrecognized event yields
+  // all-null/false rather than throwing, so a wrong assumption here degrades
+  // to "no visible delta for that event" rather than breaking the stream.
+  parseSSEEvent(eventBlock) {
+    let dataLine = null;
+    eventBlock.split('\n').forEach(function(l) {
+      if (l.indexOf('data:') === 0) dataLine = l.slice(5).trim();
+    });
+    if (!dataLine || dataLine === '[DONE]') return { delta: null, usage: null, done: dataLine === '[DONE]' };
+    let data;
+    try { data = JSON.parse(dataLine); } catch (e) { return { delta: null, usage: null, done: false }; }
+    if (data.type === 'response.output_text.delta' && typeof data.delta === 'string') {
+      return { delta: data.delta, usage: null, done: false };
+    }
+    if (data.type === 'response.completed' && data.response && data.response.usage) {
+      const u = data.response.usage;
+      return {
+        delta: null,
+        usage: { inputTokens: u.input_tokens != null ? u.input_tokens : null, outputTokens: u.output_tokens != null ? u.output_tokens : null, totalTokens: u.total_tokens != null ? u.total_tokens : null, providerUsageRaw: u },
+        done: true,
+        resolvedModel: (data.response && data.response.model) || null
+      };
+    }
+    return { delta: null, usage: null, done: false };
   }
 };
 
@@ -350,6 +420,40 @@ const geminiAdapter = {
         ? 'AI request timed out. The model took too long to respond — please try again.'
         : 'Proxy could not reach Gemini. Check your network or try again.'
     };
+  },
+
+  // v-next (Requirement Agent streaming). [VERIFY] — LOWEST confidence of
+  // the three: the Interactions API's streaming event shape was not part of
+  // any confirmed-via-direct-paste source used elsewhere in this file (see
+  // the non-streaming normalizeSuccess() comment above). Best-effort mirror
+  // of the non-streaming steps[]/model_output shape, assuming each SSE event
+  // carries one incremental steps[] entry. If this assumption is wrong in
+  // practice, the effect is limited and safe: Gemini-provider Requirement
+  // Agent turns simply show no incremental deltas (falls back to appearing
+  // all at once when the stream ends), never a broken/wrong response —
+  // worth a live check against a real Gemini-provider company before
+  // treating this as confirmed.
+  parseSSEEvent(eventBlock) {
+    let dataLine = null;
+    eventBlock.split('\n').forEach(function(l) {
+      if (l.indexOf('data:') === 0) dataLine = l.slice(5).trim();
+    });
+    if (!dataLine) return { delta: null, usage: null, done: false };
+    let data;
+    try { data = JSON.parse(dataLine); } catch (e) { return { delta: null, usage: null, done: false }; }
+    const stepsArr = Array.isArray(data.steps) ? data.steps : [];
+    const modelOutputStep = stepsArr.find(function(s) { return s && s.type === 'model_output'; });
+    const textParts = modelOutputStep && Array.isArray(modelOutputStep.content)
+      ? modelOutputStep.content.filter(function(c) { return c && c.type === 'text'; }).map(function(c) { return c.text || ''; })
+      : [];
+    const delta = textParts.length ? textParts.join('') : null;
+    const usage = data.usage ? {
+      inputTokens: data.usage.total_input_tokens != null ? data.usage.total_input_tokens : null,
+      outputTokens: data.usage.total_output_tokens != null ? data.usage.total_output_tokens : null,
+      totalTokens: data.usage.total_tokens != null ? data.usage.total_tokens : null,
+      providerUsageRaw: data.usage
+    } : null;
+    return { delta: delta, usage: usage, done: !!data.done, resolvedModel: data.model || null };
   }
 };
 
