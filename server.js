@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// AI PM Toolkit — Multi-Provider AI Proxy (v9.14 — was Anthropic-only)
+// AI PM Toolkit — Multi-Provider AI Proxy (v9.23.02 — multi-provider since v9.14)
 // Render.com deployment
 //
 // Responsibilities:
@@ -15,7 +15,10 @@
 //   - Rate limit: RATE_LIMIT_MAX req/min per IP
 //
 // Required env vars (set in Render dashboard):
-//   ALLOWED_ORIGIN        — single origin allowed e.g. https://productdiagnostics.netlify.app
+//   ALLOWED_ORIGIN        — comma-separated list of allowed origins, e.g.
+//                           https://productdiagnostics.netlify.app,https://white-ocean-059656610.7.azurestaticapps.net
+//                           (name kept singular for continuity with existing Render env var config —
+//                           it now holds one or more origins, not exactly one)
 //   SUPABASE_URL          — from Supabase project → Settings → API → Project URL
 //                           JWKS endpoint derived automatically: SUPABASE_URL/auth/v1/.well-known/jwks.json
 //   ANTHROPIC_API_KEY     — optional shared org key; if unset, requires user BYOK key
@@ -47,7 +50,21 @@ const RATE_LIMIT_MAX        = 100; // requests per window per IP
 const RATE_LIMIT_WINDOW_MIN = 1;   // window size in minutes
 
 // ── Env vars ──────────────────────────────────────────────────────────────────
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '';
+// ALLOWED_ORIGIN now holds one or more comma-separated origins (was a single
+// exact-match string). Parsed the same way as INVITE_REDIRECT_ALLOWLIST below
+// — split, trim, filter empties, normalize via the URL constructor so a
+// trailing-slash typo in the env var can't silently fail to match. Supports
+// this proxy being called from multiple hosted frontends at once (Netlify +
+// Azure Static Web Apps) without branching on which platform is calling.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '')
+  .split(',')
+  .map(function(s){ return s.trim(); })
+  .filter(Boolean)
+  .map(function(s){
+    try { return new URL(s).origin; }
+    catch(e) { console.warn('[WARN] invalid ALLOWED_ORIGIN entry, ignoring:', s); return ''; }
+  })
+  .filter(Boolean);
 const SUPABASE_URL   = process.env.SUPABASE_URL   || '';
 
 // ── Invite redirect allow-list (Phase 4, v8.112) ────────────────────────────
@@ -110,7 +127,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 // Warn on startup if critical env vars are missing
 if (!SUPABASE_URL)    console.warn('[WARN] SUPABASE_URL not set — JWT verification will fail');
-if (!ALLOWED_ORIGIN)  console.warn('[WARN] ALLOWED_ORIGIN not set — all origins will be blocked');
+if (!ALLOWED_ORIGINS.length) console.warn('[WARN] ALLOWED_ORIGIN not set (or contains no valid origins) — all origins will be blocked');
 if (!SUPABASE_SERVICE_ROLE_KEY) console.warn('[WARN] SUPABASE_SERVICE_ROLE_KEY not set — /api/check-company-name and admin routes will fail');
 if (!INVITE_REDIRECT_ALLOWLIST.length) console.warn('[WARN] INVITE_REDIRECT_ALLOWLIST not set — invite links will use the Supabase project default Site URL only');
 
@@ -183,14 +200,14 @@ const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true); // curl, Postman, server-to-server
     if (
-      (ALLOWED_ORIGIN && origin === ALLOWED_ORIGIN) ||
+      ALLOWED_ORIGINS.includes(origin) ||
       LOCAL_ORIGINS.includes(origin) ||
       origin.startsWith('http://localhost') ||
       origin.startsWith('http://127.0.0.1')
     ) {
       return callback(null, true);
     }
-    console.warn('[CORS] Origin blocked:', origin, '— Allowed:', ALLOWED_ORIGIN || '(none set)');
+    console.warn('[CORS] Origin blocked:', origin, '— Allowed:', ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : '(none set)');
     return callback(new Error('CORS: origin not allowed — ' + origin));
   },
   methods: ['POST', 'OPTIONS'],
