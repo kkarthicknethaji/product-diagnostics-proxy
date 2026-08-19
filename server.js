@@ -1553,6 +1553,38 @@ app.post('/api/team/revoke', async (req, res) => {
   }
 });
 
+// ── TEMPORARY DIAGNOSTIC — Azure OpenAI embedding smoke test ───────────────────
+// Added to answer OI-6 (Render vs. Netlify Functions for the embedding call).
+// DELETE THIS ROUTE once the smoke test result is known — it is not part of
+// the real /api/embed route from the RAG spec, and deliberately has NO auth
+// middleware, since it's only testing this server's own outbound reachability
+// to Azure, not the user-facing auth flow. Do not copy this route's shape as
+// a template for the real /api/embed route, which the spec requires to sit
+// behind the same auth middleware as every other route in this file.
+app.post('/api/_smoketest-embed', async (req, res) => {
+  const start = Date.now();
+  try {
+    const r = await fetch(
+      `${process.env.AZURE_OPENAI_ENDPOINT}openai/deployments/${process.env.AZURE_OPENAI_EMBED_DEPLOYMENT}/embeddings?api-version=2024-12-01-preview`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'api-key': process.env.AZURE_OPENAI_KEY },
+        body: JSON.stringify({ input: 'smoke test' })
+      }
+    );
+    const data = await r.json();
+    res.json({
+      ok: r.ok,
+      status: r.status,
+      dims: data?.data?.[0]?.embedding?.length,
+      latencyMs: Date.now() - start,
+      raw: data
+    });
+  } catch (err) {
+    res.json({ ok: false, error: String(err), latencyMs: Date.now() - start });
+  }
+});
+
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(200).json({
