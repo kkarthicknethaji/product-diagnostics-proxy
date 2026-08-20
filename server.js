@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// AI PM Toolkit — Multi-Provider AI Proxy (v9.23.02 — multi-provider since v9.14)
+// AI PM Toolkit — Multi-Provider AI Proxy (v9.23.03 — multi-provider since v9.14; /api/embed + /api/embed-info added v9.23.03, RA-Persistent-Doc-RAG-Spec-v14)
 // Render.com deployment
 //
 // Responsibilities:
@@ -24,6 +24,13 @@
 //   ANTHROPIC_API_KEY     — optional shared org key; if unset, requires user BYOK key
 //   OPENAI_API_KEY        — optional shared org key for OpenAI; same fallback role as ANTHROPIC_API_KEY
 //   GEMINI_API_KEY        — optional shared org key for Gemini; same fallback role as ANTHROPIC_API_KEY
+//   AZURE_OPENAI_ENDPOINT — Requirement Agent persistent-doc RAG (v14): Azure OpenAI
+//                           resource endpoint, e.g. https://vspm-azureai.openai.azure.com
+//   AZURE_OPENAI_KEY      — Azure OpenAI resource API key (api-key header auth)
+//   AZURE_OPENAI_EMBED_DEPLOYMENT — the embedding deployment name (sent as the
+//                           request body's `model` field — Azure's v1 embeddings
+//                           API resolves deployments this way, not via a URL path
+//                           segment; see /api/embed below)
 //
 // Removed env vars (no longer needed — Supabase migrated from HS256 to ECC P-256):
 //   SUPABASE_JWT_SECRET — delete from Render dashboard; JWKS verification replaces it
@@ -66,6 +73,13 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '')
   })
   .filter(Boolean);
 const SUPABASE_URL   = process.env.SUPABASE_URL   || '';
+
+// v14 (RA-Persistent-Doc-RAG-Spec-v14, D4/D6) — Requirement Agent persistent-
+// document embeddings, via Azure OpenAI. Trimmed of any trailing slash so the
+// path built in _embedAzure() below never ends up with a doubled "//".
+const AZURE_OPENAI_ENDPOINT = (process.env.AZURE_OPENAI_ENDPOINT || '').replace(/\/+$/, '');
+const AZURE_OPENAI_KEY      = process.env.AZURE_OPENAI_KEY || '';
+const AZURE_OPENAI_EMBED_DEPLOYMENT = process.env.AZURE_OPENAI_EMBED_DEPLOYMENT || '';
 
 // ── Invite redirect allow-list (Phase 4, v8.112) ────────────────────────────
 // Comma-separated exact origins, parsed once at boot. Deliberately NOT a
@@ -130,6 +144,7 @@ if (!SUPABASE_URL)    console.warn('[WARN] SUPABASE_URL not set — JWT verifica
 if (!ALLOWED_ORIGINS.length) console.warn('[WARN] ALLOWED_ORIGIN not set (or contains no valid origins) — all origins will be blocked');
 if (!SUPABASE_SERVICE_ROLE_KEY) console.warn('[WARN] SUPABASE_SERVICE_ROLE_KEY not set — /api/check-company-name and admin routes will fail');
 if (!INVITE_REDIRECT_ALLOWLIST.length) console.warn('[WARN] INVITE_REDIRECT_ALLOWLIST not set — invite links will use the Supabase project default Site URL only');
+if (!AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_KEY || !AZURE_OPENAI_EMBED_DEPLOYMENT) console.warn('[WARN] AZURE_OPENAI_ENDPOINT/AZURE_OPENAI_KEY/AZURE_OPENAI_EMBED_DEPLOYMENT not fully set — /api/embed and /api/embed-info will fail');
 
 // Admin client — bypasses RLS by design, used only for the narrow set of
 // server-side operations that need it (pre-auth company name checks here;
@@ -210,7 +225,12 @@ const corsOptions = {
     console.warn('[CORS] Origin blocked:', origin, '— Allowed:', ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : '(none set)');
     return callback(new Error('CORS: origin not allowed — ' + origin));
   },
-  methods: ['POST', 'OPTIONS'],
+  // v14 — 'GET' added for /api/embed-info (every other route in this file is
+  // POST-only). Widening the shared allow-list rather than forking a second
+  // CORS config object for one route — this only affects what the BROWSER's
+  // own preflight is told is allowed, not an authorization boundary
+  // (requireAuthStrict + the RA RPCs' own checks are that boundary).
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Auth-Token'],
   optionsSuccessStatus: 204
 };
@@ -1042,6 +1062,147 @@ app.post('/api/check-company-name', async (req, res) => {
     console.error('[CHECK-COMPANY] exception:', err.message);
     return res.status(200).json({ exists: false, error: 'Check failed — proceeding as no match.' });
   }
+});
+
+// ── Embeddings — Requirement Agent persistent-document RAG (v14) ─────────────
+// RA-Persistent-Doc-RAG-Spec-v14, D4/D6. Two routes: POST /api/embed (batch-
+// embeds chunk texts) and GET /api/embed-info (reports the current schema
+// version for the client's compatibility badge). Both registered before the
+// 404 catch-all below, under this file's existing CORS allow-list (not just
+// its auth middleware — the diagnostic route used during OI-6's smoke test
+// skipped CORS registration specifically and was rejected from real app
+// traffic for exactly that reason), same JWT auth (requireAuthStrict) as
+// every other authenticated route, and this file's own rate-limit pattern.
+
+app.options('/api/embed', cors(corsOptions));
+app.options('/api/embed-info', cors(corsOptions));
+
+const embedLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MIN * 60 * 1000,
+  max: RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(200).json({
+      error: {
+        type: 'rate_limit_error',
+        message: `Too many requests — limit is ${RATE_LIMIT_MAX} per ${RATE_LIMIT_WINDOW_MIN === 1 ? 'minute' : RATE_LIMIT_WINDOW_MIN + ' minutes'}. Please wait and try again.`
+      }
+    });
+  }
+});
+app.use('/api/embed', embedLimiter);
+app.use('/api/embed-info', embedLimiter);
+app.use('/api/embed', requireAuthStrict);
+app.use('/api/embed-info', requireAuthStrict);
+// Scoped to /api/embed only — /api/embed-info has no body. 2mb comfortably
+// covers D4's own ~200,000-character aggregate cap (re-checked explicitly
+// inside the handler below — this Express-level limit is just the outer
+// safety net, not the real enforcement point).
+app.use('/api/embed', express.json({ limit: '2mb' }));
+
+// D6 — deliberately a hardcoded, maintained-by-hand constant, never derived
+// from Azure deployment configuration or an env var (an earlier draft of
+// this spec tried deriving it and found that unsafe — a deployment-side
+// change wouldn't reliably bump it, silently mixing embeddings from two
+// incompatible schema generations in the same table). Bump this string
+// value by hand if the embedding model/deployment ever materially changes.
+const EMBEDDING_SCHEMA_VERSION = 'azure-text-embedding-3-small-v1';
+const EMBEDDING_DIMENSIONS = 1536;
+
+// D4 per-request/aggregate caps — checked here, before ever calling Azure,
+// not relied on Azure to reject (Azure's own limits — 2048 inputs/request,
+// 8192 tokens/input, 300,000 tokens/request aggregate — are comfortably
+// wider than these, so these are this app's own, tighter, deliberate caps).
+const EMBED_MAX_TEXTS = 200;
+const EMBED_MAX_CHARS_PER_TEXT = 4000;
+const EMBED_MAX_AGGREGATE_CHARS = 200000;
+
+// Calls Azure OpenAI's current (2026) v1 embeddings endpoint — confirmed
+// against Microsoft's live REST reference during this build, not assumed
+// from an older code sample: POST {endpoint}/openai/v1/embeddings, api-key
+// header auth, the deployment name passed as the body's `model` field (not
+// a URL path segment — that's the OLDER, now-superseded deployment-scoped
+// pattern). Explicit timeout via AbortController (D8) — embeddings are
+// normally fast, but a batch of up to 200 texts gets a generous margin.
+async function _embedAzure(texts) {
+  if (!AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_KEY || !AZURE_OPENAI_EMBED_DEPLOYMENT) {
+    throw new Error('Azure OpenAI embedding is not configured on this proxy.');
+  }
+  const controller = new AbortController();
+  const timeoutMs = 30000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(AZURE_OPENAI_ENDPOINT + '/openai/v1/embeddings?api-version=v1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'api-key': AZURE_OPENAI_KEY },
+      body: JSON.stringify({ model: AZURE_OPENAI_EMBED_DEPLOYMENT, input: texts }),
+      signal: controller.signal
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data) {
+      const msg = (data && data.error && data.error.message) || ('Azure OpenAI embedding request failed (HTTP ' + r.status + ').');
+      throw new Error(msg);
+    }
+    if (!Array.isArray(data.data) || data.data.length !== texts.length) {
+      throw new Error('Azure OpenAI returned an unexpected number of embeddings.');
+    }
+    // Sort by Azure's own `index` field rather than trusting array order —
+    // the API does not explicitly document ordering as guaranteed, and this
+    // is the one place a silent misalignment would corrupt every chunk's
+    // embedding without any visible symptom.
+    const ordered = data.data.slice().sort((a, b) => a.index - b.index);
+    const embeddings = ordered.map(item => item.embedding);
+    // D6 — explicit dimension validation: reject before this ever reaches
+    // the database, rather than letting a malformed/mismatched response
+    // surface as a confusing pgvector cast error three layers away.
+    for (let i = 0; i < embeddings.length; i++) {
+      if (!Array.isArray(embeddings[i]) || embeddings[i].length !== EMBEDDING_DIMENSIONS) {
+        throw new Error('Azure OpenAI returned an embedding with an unexpected dimension count.');
+      }
+    }
+    return embeddings;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+app.post('/api/embed', async (req, res) => {
+  try {
+    const texts = req.body && req.body.texts;
+    if (!Array.isArray(texts) || texts.length === 0 || texts.length > EMBED_MAX_TEXTS) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'texts must be a non-empty array of at most ' + EMBED_MAX_TEXTS + ' strings.' } });
+    }
+    let aggregateChars = 0;
+    for (let i = 0; i < texts.length; i++) {
+      if (typeof texts[i] !== 'string' || !texts[i].trim()) {
+        return res.status(200).json({ error: { type: 'invalid_request', message: 'Every entry in texts must be a non-empty string.' } });
+      }
+      if (texts[i].length > EMBED_MAX_CHARS_PER_TEXT) {
+        return res.status(200).json({ error: { type: 'invalid_request', message: 'Each text must be at most ' + EMBED_MAX_CHARS_PER_TEXT + ' characters.' } });
+      }
+      aggregateChars += texts[i].length;
+    }
+    if (aggregateChars > EMBED_MAX_AGGREGATE_CHARS) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'Total text length across this request is too large.' } });
+    }
+
+    const embeddings = await _embedAzure(texts);
+    return res.status(200).json({ embeddings, embedding_schema_version: EMBEDDING_SCHEMA_VERSION });
+  } catch (err) {
+    const isTimeout = err && err.name === 'AbortError';
+    console.error('[EMBED] error:', err && err.message);
+    return res.status(200).json({
+      error: {
+        type: isTimeout ? 'timeout_error' : 'proxy_error',
+        message: isTimeout ? 'Embedding request timed out. Please try again.' : 'Could not generate embeddings. Please try again.'
+      }
+    });
+  }
+});
+
+app.get('/api/embed-info', (req, res) => {
+  return res.status(200).json({ embedding_schema_version: EMBEDDING_SCHEMA_VERSION });
 });
 
 // ── Team Management (Phase 4) ─────────────────────────────────────────────────
