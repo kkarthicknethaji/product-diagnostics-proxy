@@ -111,8 +111,9 @@ const anthropicAdapter = {
       usage: data.usage ? {
         inputTokens: data.usage.input_tokens != null ? data.usage.input_tokens : null,
         outputTokens: data.usage.output_tokens != null ? data.usage.output_tokens : null,
-        totalTokens: (data.usage.input_tokens != null && data.usage.output_tokens != null) ? (data.usage.input_tokens + data.usage.output_tokens) : null
-      } : { inputTokens: null, outputTokens: null, totalTokens: null },
+        totalTokens: (data.usage.input_tokens != null && data.usage.output_tokens != null) ? (data.usage.input_tokens + data.usage.output_tokens) : null,
+        cacheReadTokens: data.usage.cache_read_input_tokens != null ? data.usage.cache_read_input_tokens : null
+      } : { inputTokens: null, outputTokens: null, totalTokens: null, cacheReadTokens: null },
       providerUsageRaw: data.usage || null,
       providerRequestId: data.id || null
     };
@@ -191,13 +192,13 @@ const anthropicAdapter = {
     if (data.type === 'message_start' && data.message) {
       return {
         delta: null,
-        usage: data.message.usage ? { inputTokens: data.message.usage.input_tokens != null ? data.message.usage.input_tokens : null, outputTokens: null, totalTokens: null, providerUsageRaw: data.message.usage } : null,
+        usage: data.message.usage ? { inputTokens: data.message.usage.input_tokens != null ? data.message.usage.input_tokens : null, outputTokens: null, totalTokens: null, cacheReadTokens: data.message.usage.cache_read_input_tokens != null ? data.message.usage.cache_read_input_tokens : null, providerUsageRaw: data.message.usage } : null,
         done: false,
         resolvedModel: data.message.model || null
       };
     }
     if (data.type === 'message_delta' && data.usage) {
-      return { delta: null, usage: { inputTokens: null, outputTokens: data.usage.output_tokens != null ? data.usage.output_tokens : null, totalTokens: null, providerUsageRaw: data.usage }, done: false };
+      return { delta: null, usage: { inputTokens: null, outputTokens: data.usage.output_tokens != null ? data.usage.output_tokens : null, totalTokens: null, cacheReadTokens: data.usage.cache_read_input_tokens != null ? data.usage.cache_read_input_tokens : null, providerUsageRaw: data.usage }, done: false };
     }
     if (data.type === 'message_stop') {
       return { delta: null, usage: null, done: true };
@@ -256,8 +257,9 @@ const openaiAdapter = {
       usage: data.usage ? {
         inputTokens: data.usage.input_tokens != null ? data.usage.input_tokens : null,
         outputTokens: data.usage.output_tokens != null ? data.usage.output_tokens : null,
-        totalTokens: data.usage.total_tokens != null ? data.usage.total_tokens : null
-      } : { inputTokens: null, outputTokens: null, totalTokens: null },
+        totalTokens: data.usage.total_tokens != null ? data.usage.total_tokens : null,
+        cacheReadTokens: (data.usage.input_tokens_details && data.usage.input_tokens_details.cached_tokens != null) ? data.usage.input_tokens_details.cached_tokens : null
+      } : { inputTokens: null, outputTokens: null, totalTokens: null, cacheReadTokens: null },
       providerUsageRaw: data.usage || null,
       providerRequestId: data.id || null
     };
@@ -316,7 +318,7 @@ const openaiAdapter = {
       const u = data.response.usage;
       return {
         delta: null,
-        usage: { inputTokens: u.input_tokens != null ? u.input_tokens : null, outputTokens: u.output_tokens != null ? u.output_tokens : null, totalTokens: u.total_tokens != null ? u.total_tokens : null, providerUsageRaw: u },
+        usage: { inputTokens: u.input_tokens != null ? u.input_tokens : null, outputTokens: u.output_tokens != null ? u.output_tokens : null, totalTokens: u.total_tokens != null ? u.total_tokens : null, cacheReadTokens: (u.input_tokens_details && u.input_tokens_details.cached_tokens != null) ? u.input_tokens_details.cached_tokens : null, providerUsageRaw: u },
         done: true,
         resolvedModel: (data.response && data.response.model) || null
       };
@@ -381,8 +383,9 @@ const geminiAdapter = {
       usage: usage ? {
         inputTokens: usage.total_input_tokens != null ? usage.total_input_tokens : null,
         outputTokens: usage.total_output_tokens != null ? usage.total_output_tokens : null,
-        totalTokens: usage.total_tokens != null ? usage.total_tokens : null
-      } : { inputTokens: null, outputTokens: null, totalTokens: null },
+        totalTokens: usage.total_tokens != null ? usage.total_tokens : null,
+        cacheReadTokens: usage.total_cached_tokens != null ? usage.total_cached_tokens : null
+      } : { inputTokens: null, outputTokens: null, totalTokens: null, cacheReadTokens: null },
       // Gemini breaks usage down further than the other two providers even
       // for a text-only call (total_cached_tokens, total_thought_tokens,
       // total_tool_use_tokens, and input_tokens_by_modality — an array, not
@@ -451,6 +454,7 @@ const geminiAdapter = {
       inputTokens: data.usage.total_input_tokens != null ? data.usage.total_input_tokens : null,
       outputTokens: data.usage.total_output_tokens != null ? data.usage.total_output_tokens : null,
       totalTokens: data.usage.total_tokens != null ? data.usage.total_tokens : null,
+      cacheReadTokens: data.usage.total_cached_tokens != null ? data.usage.total_cached_tokens : null,
       providerUsageRaw: data.usage
     } : null;
     return { delta: delta, usage: usage, done: !!data.done, resolvedModel: data.model || null };

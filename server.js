@@ -172,6 +172,161 @@ async function _insertAiUsageEvent(fields) {
   } catch (e) {
     console.error('[AI USAGE] insert exception:', e.message);
   }
+  // Opportunistic budget-alert check (AI Cost Control Tower, v9.28/v9.28.01)
+  // — fire-and-forget, never awaited by the caller, so it adds no latency to
+  // the AI response. Never throws outward, same discipline as the insert
+  // above: a telemetry/alerting failure must never surface as a generation
+  // failure to the end user.
+  _checkBudgetAlertsOpportunistic(fields.company_id).catch(function(e) {
+    console.error('[AI BUDGET ALERT] check exception:', e.message);
+  });
+}
+
+// ── Budget-alert opportunistic check (v9.28.01) ──────────────────────────────
+// No cron infrastructure exists in this app (AI Cost Control Tower spec,
+// Section 6.6) — piggybacked onto the highest-frequency write this app
+// already makes (a usage-event insert) rather than standing up new
+// scheduling. Throttled per company so a burst of calls doesn't re-run the
+// full spend computation on every single one; a few-minute staleness on
+// alert timing is an accepted tradeoff, not a correctness requirement.
+const _budgetAlertLastCheckedAt = new Map(); // company_id -> ms timestamp
+const BUDGET_ALERT_CHECK_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
+
+// A generous, explicit cap rather than relying on whatever PostgREST's
+// unconfigured default max-rows happens to be — makes the limit a documented
+// fact instead of an implicit one, and cheap to raise later if real volume
+// ever approaches it.
+const MONTH_TO_DATE_SPEND_ROW_CAP = 20000;
+
+// Month boundary in UTC, not the Node process's host-local time. The
+// dashboard (scripts/cost-tower.js) computes "this month" in the admin's
+// browser-local time, so neither reference can match arbitrary browser
+// timezones exactly — but UTC is at least a fixed, documented reference
+// point that doesn't silently shift if the proxy is ever redeployed to a
+// different server region, which host-local time would. Closing the gap
+// with the admin's actual timezone would need a stored per-company
+// timezone preference; not attempted here.
+function _utcMonthBoundary(offsetMonths) {
+  var d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + offsetMonths, 1));
+}
+
+// Recomputes calculated_cost the same way mt_ai_cost_events_list() does
+// (sql/ai-cost-tower.sql), in JS rather than SQL — supabaseAdmin runs under
+// the service role with no authenticated-user JWT context, so the RPC's own
+// _cost_tower_is_admin() gate (which depends on current_app_user()) cannot
+// be satisfied from here; querying the two tables directly and joining in
+// JS sidesteps that without weakening the RPC's admin gate for real callers.
+// Mirrors the RPC's COALESCE(response_model, requested_model) — falls back
+// only on a real null, not on any other falsy value — so the two formulas
+// can't disagree on which price row a call matches.
+async function _computeMonthToDateSpend(companyId) {
+  const monthStartIso = _utcMonthBoundary(0).toISOString();
+
+  const [{ data: events, error: evErr }, { data: pricing, error: pErr }] = await Promise.all([
+    supabaseAdmin
+      .from('mt_ai_usage_events')
+      .select('provider, requested_model, response_model, input_tokens, output_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, request_started_at')
+      .eq('company_id', companyId)
+      .gte('request_started_at', monthStartIso)
+      .limit(MONTH_TO_DATE_SPEND_ROW_CAP),
+    supabaseAdmin
+      .from('mt_model_pricing')
+      .select('provider, model_name, input_price_per_mtok, output_price_per_mtok, cache_write_5m_price_per_mtok, cache_write_1h_price_per_mtok, cache_read_price_per_mtok, effective_from, effective_to')
+  ]);
+  if (evErr || !events) {
+    if (evErr) console.warn('[AI BUDGET ALERT] usage-events query failed:', evErr.message);
+    return null;
+  }
+  if (pErr || !pricing) {
+    if (pErr) console.warn('[AI BUDGET ALERT] pricing query failed:', pErr.message);
+    return null;
+  }
+
+  // Pre-index pricing by provider|model_name with epoch-ms bounds computed
+  // once, so each event does a short scan within its own model's price
+  // history instead of the whole pricing table, and never allocates a Date
+  // per comparison (was O(events x pricing_rows) with 2 Date allocations
+  // per comparison; now O(events + pricing_rows)).
+  const pricingByKey = {};
+  pricing.forEach(function(p) {
+    const key = p.provider + '|' + p.model_name;
+    (pricingByKey[key] = pricingByKey[key] || []).push({
+      input_price_per_mtok: p.input_price_per_mtok,
+      output_price_per_mtok: p.output_price_per_mtok,
+      cache_write_5m_price_per_mtok: p.cache_write_5m_price_per_mtok,
+      cache_write_1h_price_per_mtok: p.cache_write_1h_price_per_mtok,
+      cache_read_price_per_mtok: p.cache_read_price_per_mtok,
+      effectiveFromMs: new Date(p.effective_from).getTime(),
+      effectiveToMs: p.effective_to ? new Date(p.effective_to).getTime() : null
+    });
+  });
+
+  let total = 0;
+  for (const e of events) {
+    const modelKey = e.response_model != null ? e.response_model : e.requested_model;
+    const candidates = pricingByKey[e.provider + '|' + modelKey];
+    if (!candidates) continue; // unpriced call — excluded, same as the RPC's LEFT JOIN + NULL calculated_cost
+    const atMs = new Date(e.request_started_at).getTime();
+    const match = candidates.find(function(p) {
+      return atMs >= p.effectiveFromMs && (p.effectiveToMs === null || atMs < p.effectiveToMs);
+    });
+    if (!match) continue;
+    total += (e.input_tokens || 0) / 1000000 * match.input_price_per_mtok
+      + (e.output_tokens || 0) / 1000000 * match.output_price_per_mtok
+      + (e.cache_creation_5m_tokens || 0) / 1000000 * match.cache_write_5m_price_per_mtok
+      + (e.cache_creation_1h_tokens || 0) / 1000000 * match.cache_write_1h_price_per_mtok
+      + (e.cache_read_tokens || 0) / 1000000 * match.cache_read_price_per_mtok;
+  }
+  return total;
+}
+
+async function _checkBudgetAlertsOpportunistic(companyId) {
+  if (!supabaseAdmin || !companyId) return;
+  const lastChecked = _budgetAlertLastCheckedAt.get(companyId) || 0;
+  if (Date.now() - lastChecked < BUDGET_ALERT_CHECK_THROTTLE_MS) return;
+  _budgetAlertLastCheckedAt.set(companyId, Date.now());
+
+  const { data: budget, error: budgetErr } = await supabaseAdmin
+    .from('mt_ai_budgets')
+    .select('*')
+    .eq('company_id', companyId)
+    .eq('scope_type', 'overall')
+    .eq('is_active', true)
+    .maybeSingle();
+  if (budgetErr || !budget) return; // no active budget configured — nothing to check against
+
+  const spend = await _computeMonthToDateSpend(companyId);
+  if (spend === null) return;
+
+  const periodStart = _utcMonthBoundary(0).toISOString().slice(0, 10);
+  const periodEnd = _utcMonthBoundary(1).toISOString().slice(0, 10);
+  const pct = (spend / Number(budget.amount)) * 100;
+
+  // Both thresholds are checked independently (not else-if) — if spend jumps
+  // past both between two opportunistic checks, both get their own alert
+  // row, matching how a real-time check would have fired them separately.
+  // The UNIQUE(budget_id, threshold_type, period_start) constraint is what
+  // actually enforces "once per threshold per period," not this code —
+  // a duplicate insert attempt fails with 23505 (unique_violation), caught
+  // and ignored below as the expected, silent outcome.
+  const thresholdsCrossed = [];
+  if (pct >= Number(budget.warn_threshold_pct)) thresholdsCrossed.push({ threshold_type: 'warn', threshold_pct: budget.warn_threshold_pct });
+  if (pct >= Number(budget.escalate_threshold_pct)) thresholdsCrossed.push({ threshold_type: 'escalate', threshold_pct: budget.escalate_threshold_pct });
+
+  for (const t of thresholdsCrossed) {
+    const { error } = await supabaseAdmin.from('mt_ai_alerts').insert({
+      budget_id: budget.budget_id,
+      threshold_type: t.threshold_type,
+      threshold_pct: t.threshold_pct,
+      current_spend: spend,
+      period_start: periodStart,
+      period_end: periodEnd
+    });
+    if (error && error.code !== '23505') {
+      console.warn('[AI BUDGET ALERT] alert insert failed:', error.message);
+    }
+  }
 }
 
 // ── JWKS client ───────────────────────────────────────────────────────────────
@@ -522,6 +677,26 @@ function _callUpstream(upstreamReq, timeoutMs, onTimeoutLog) {
 // `data: {"done":true}` (or `data: {"error":true,"message":"..."}` if the
 // upstream connection drops mid-stream — no retry is possible at that point,
 // same limitation any streaming client has).
+// Shared "no usage data" shape for _streamUpstreamOnce's two return sites
+// (initial accumulator, mid-stream-error fallback) — kept as one factory so
+// a future field addition/removal only needs one edit, not two in lockstep.
+function _emptyStreamUsage() {
+  return { inputTokens: null, outputTokens: null, totalTokens: null, cacheReadTokens: null, providerUsageRaw: null, resolvedModel: null };
+}
+
+// Anthropic's cache-creation buckets (5m/1h ephemeral writes) have no
+// equivalent on OpenAI/Gemini's raw usage shape (confirmed in
+// proxy/providerAdapters.js's adapter comments), so they're read directly
+// off the raw usage object here rather than normalized into the adapter's
+// shared `usage` shape the way cacheReadTokens is. Shared between the
+// streaming and non-streaming success paths below, which otherwise had to
+// duplicate this same guard+field-access pattern.
+function _extractAnthropicCacheCreation(provider, rawUsage, field) {
+  if (provider !== 'anthropic' || !rawUsage || !rawUsage.cache_creation) return null;
+  var v = rawUsage.cache_creation[field];
+  return v != null ? v : null;
+}
+
 function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog) {
   const https = require('https');
   const { StringDecoder } = require('string_decoder');
@@ -561,7 +736,7 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       let sseBuffer = '';
       let responseBytes = 0;
-      const usage = { inputTokens: null, outputTokens: null, totalTokens: null, providerUsageRaw: null, resolvedModel: null };
+      const usage = _emptyStreamUsage();
       // StringDecoder (Node core), not Buffer#toString('utf8') per chunk —
       // a multi-byte UTF-8 character split across two TCP chunks would
       // otherwise decode independently in each chunk and come out as a
@@ -587,7 +762,14 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
             if (parsedEvt.usage.inputTokens != null) usage.inputTokens = parsedEvt.usage.inputTokens;
             if (parsedEvt.usage.outputTokens != null) usage.outputTokens = parsedEvt.usage.outputTokens;
             if (parsedEvt.usage.totalTokens != null) usage.totalTokens = parsedEvt.usage.totalTokens;
-            if (parsedEvt.usage.providerUsageRaw != null) usage.providerUsageRaw = parsedEvt.usage.providerUsageRaw;
+            if (parsedEvt.usage.cacheReadTokens != null) usage.cacheReadTokens = parsedEvt.usage.cacheReadTokens;
+            // Shallow merge, not overwrite: Anthropic's message_start event carries
+            // cache_creation/cache_read_input_tokens, message_delta carries only
+            // output_tokens — a wholesale overwrite here silently dropped
+            // message_start's cache fields once message_delta arrived (spec
+            // Section 11 item 11). Confirmed this never affected output_tokens
+            // itself, which is guarded per-field above, independent of this object.
+            if (parsedEvt.usage.providerUsageRaw != null) usage.providerUsageRaw = Object.assign({}, usage.providerUsageRaw, parsedEvt.usage.providerUsageRaw);
           }
           if (parsedEvt.resolvedModel != null) usage.resolvedModel = parsedEvt.resolvedModel;
         });
@@ -616,7 +798,7 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
           res.write('data: ' + JSON.stringify({ error: true, message: upstreamTimedOut ? 'Upstream timed out mid-stream.' : ('Stream interrupted: ' + (err.message || 'unknown error')) }) + '\n\n');
           res.end();
         } catch (e) {}
-        resolve({ streamed: true, usage: { inputTokens: null, outputTokens: null, totalTokens: null, providerUsageRaw: null, resolvedModel: null }, requestBytes: bodyBytes, responseBytes: 0, midStreamError: true });
+        resolve({ streamed: true, usage: _emptyStreamUsage(), requestBytes: bodyBytes, responseBytes: 0, midStreamError: true });
       } else {
         // No response ever received (headers never sent) — a genuine
         // transport-level failure, same as _callUpstream()'s own
@@ -665,7 +847,12 @@ async function _handleStreamingRequest(req, res, ctx) {
         caller: _caller, prompt_version: _promptVersion, requested_model: body.model, response_model: outcome.usage.resolvedModel,
         settings_mode: _settingsMode, settings_model: _settingsModel, selection_rule: _selectionRule,
         input_tokens: outcome.usage.inputTokens, output_tokens: outcome.usage.outputTokens,
-        cache_creation_5m_tokens: null, cache_creation_1h_tokens: null, cache_read_tokens: null,
+        // Anthropic-specific cache-write buckets, same as the non-streaming path
+        // below — only meaningful once the merge-bug fix above lets
+        // providerUsageRaw actually retain message_start's cache_creation object.
+        cache_creation_5m_tokens: _extractAnthropicCacheCreation(provider, outcome.usage.providerUsageRaw, 'ephemeral_5m_input_tokens'),
+        cache_creation_1h_tokens: _extractAnthropicCacheCreation(provider, outcome.usage.providerUsageRaw, 'ephemeral_1h_input_tokens'),
+        cache_read_tokens: outcome.usage.cacheReadTokens,
         provider_usage_raw: outcome.usage.providerUsageRaw,
         status: outcome.midStreamError ? 'error' : 'success',
         provider_http_status: 200,
@@ -930,12 +1117,16 @@ app.post('/api/anthropic', async (req, res) => {
       selection_rule: _selectionRule,
       input_tokens: _isErrorPayload ? null : _normalized.usage.inputTokens,
       output_tokens: _isErrorPayload ? null : _normalized.usage.outputTokens,
-      // Anthropic-specific cache fields — remain null for non-Anthropic
+      // Anthropic-specific cache-write buckets — remain null for non-Anthropic
       // providers, whose usage detail (if any) belongs in provider_usage_raw
       // instead of being force-fit into these Anthropic-shaped columns.
-      cache_creation_5m_tokens: (!_isErrorPayload && provider === 'anthropic' && data.usage && data.usage.cache_creation) ? data.usage.cache_creation.ephemeral_5m_input_tokens : null,
-      cache_creation_1h_tokens: (!_isErrorPayload && provider === 'anthropic' && data.usage && data.usage.cache_creation) ? data.usage.cache_creation.ephemeral_1h_input_tokens : null,
-      cache_read_tokens: (!_isErrorPayload && provider === 'anthropic' && data.usage) ? data.usage.cache_read_input_tokens : null,
+      cache_creation_5m_tokens: !_isErrorPayload ? _extractAnthropicCacheCreation(provider, data.usage, 'ephemeral_5m_input_tokens') : null,
+      cache_creation_1h_tokens: !_isErrorPayload ? _extractAnthropicCacheCreation(provider, data.usage, 'ephemeral_1h_input_tokens') : null,
+      // Cache-read is a provider-neutral concept, unlike the two buckets above —
+      // sourced through the adapter's normalized usage shape (Build B Part 1),
+      // same as input_tokens/output_tokens two lines up, rather than reading
+      // data.usage directly per provider.
+      cache_read_tokens: (!_isErrorPayload && _normalized.usage) ? _normalized.usage.cacheReadTokens : null,
       provider_usage_raw: _isErrorPayload ? null : _normalized.providerUsageRaw,
       status: _isErrorPayload ? 'error' : 'success',
       provider_http_status: httpStatus,
