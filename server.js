@@ -182,6 +182,171 @@ async function _insertAiUsageEvent(fields) {
   });
 }
 
+// ── Outcome-Based Cost (AI Cost Control Tower v2) ────────────────────────────
+// Caller attribution mode — governs whether and how a call's outcome_id gets
+// set. Four modes, no caller left to fall through a default. This is the
+// single hand-typed copy in the whole app (server.js only) — the frontend
+// fetches the Yield-relevant subset via GET /api/outcome-caller-modes rather
+// than hand-typing a second copy that could drift from this one.
+//
+// 26 entries, each independently verified against live code during Phase 1
+// build verification (not assumed from the design spec) — 25 from the
+// original sweep, plus 'cc-gen-features-cap' added during code review after
+// being missed the first time (a real, live, button-wired caller):
+//   - session_sum_anchor (10): this caller IS one of the five Journey types'
+//     own generation event. Gets outcome_id of that type's active instance.
+//   - yield_anchor (14): this caller IS a yield_ratio type's own generation
+//     event. NEVER receives outcome_id, regardless of what Journey outcome
+//     is active in the session.
+//   - attachable_support (1): incidental to whatever session_sum outcome is
+//     active. Explicit allowlist, nothing implicit.
+//   - general_usage_only (1): real spend, never attributed to any outcome
+//     type. Everything not listed here also falls through to this mode —
+//     see _resolveOutcomeId()'s fallback below, not a silent gap.
+const CALLER_ATTRIBUTION_MODE = {
+  'requirement-agent':        { mode: 'session_sum_anchor', outcomeType: 'requirement_brief' },
+  'dm-generate':              { mode: 'session_sum_anchor', outcomeType: 'discovery_map' },
+  'mi-generate':              { mode: 'session_sum_anchor', outcomeType: 'market_intelligence_report' },
+  'mi-docx-gen':              { mode: 'session_sum_anchor', outcomeType: 'market_intelligence_report' },
+  // mi-suggest fires from kpi-tree.js's generateConfirmed() (conditionally,
+  // when Market Intelligence runs before Discovery Map), before that same
+  // call's own dm-generate call — verified during Phase 1 that its success
+  // path (miData/miGenerated/miCapabilities) produces the same terminal
+  // state market-intelligence.js's own miGenerate() success does, so it can
+  // both create/attach AND complete the market_intelligence_report outcome.
+  'mi-suggest':               { mode: 'session_sum_anchor', outcomeType: 'market_intelligence_report' },
+  // Adoption Readiness Report has no single 'arp-gen' caller — verified
+  // during Phase 1 that readiness-canvas.js has FOUR separate callers, none
+  // individually "the" generation event. Outcome row is created at the top
+  // of rcCreatePlan(), before rcAiEnhanceNewPlan() fires the two racing
+  // creation-time calls (arp-change-overview, arp-impact-groups).
+  'arp-change-overview':      { mode: 'session_sum_anchor', outcomeType: 'adoption_readiness_report' },
+  'arp-impact-groups':        { mode: 'session_sum_anchor', outcomeType: 'adoption_readiness_report' },
+  'arp-readiness-actions':    { mode: 'session_sum_anchor', outcomeType: 'adoption_readiness_report' },
+  'arp-launch-narrative':     { mode: 'session_sum_anchor', outcomeType: 'adoption_readiness_report' },
+  'pi-generate':              { mode: 'session_sum_anchor', outcomeType: 'release_plan' },
+
+  'cc-gen-one':                { mode: 'yield_anchor', outcomeType: 'capability', unitsFrom: 'capabilities' },
+  'cc-gen-all':                { mode: 'yield_anchor', outcomeType: 'capability', unitsFrom: 'capabilities' },
+  'cc-regen-metric':           { mode: 'yield_anchor', outcomeType: 'capability', unitsFrom: 'capabilities' },
+  'cc-refine-metric':          { mode: 'yield_anchor', outcomeType: 'capability', unitsFrom: 'fixed_1' },
+  'cc-gen-features-pi':        { mode: 'yield_anchor', outcomeType: 'capability', unitsFrom: 'fixed_1' },
+  'cc-gen-features':           { mode: 'yield_anchor', outcomeType: 'feature', unitsFrom: 'features' },
+  // Verified: capability-canvas.js:3445-3456 parses parsed.features.map(...)
+  // identically to cc-gen-features — a real, live, button-wired per-
+  // capability variant missed in the original 25-entry sweep.
+  'cc-gen-features-cap':       { mode: 'yield_anchor', outcomeType: 'feature', unitsFrom: 'features' },
+  'fc-gen-stories':            { mode: 'yield_anchor', outcomeType: 'story', unitsFrom: 'stories' },
+  'cc-dd-single':              { mode: 'yield_anchor', outcomeType: 'kpi_dictionary_entry', unitsFrom: 'fixed_1' },
+  'cc-dd-batch':               { mode: 'yield_anchor', outcomeType: 'kpi_dictionary_entry', unitsFrom: 'dictionary_entries' },
+  'md-dd-batch':               { mode: 'yield_anchor', outcomeType: 'kpi_dictionary_entry', unitsFrom: 'dictionary_entries' },
+  'ai-recommendations':        { mode: 'yield_anchor', outcomeType: 'ai_recommendation', unitsFrom: 'recommendations' },
+  'diagnostic-leak':           { mode: 'yield_anchor', outcomeType: 'experiment', unitsFrom: 'experiments' },
+  'outcome-pulse-suggest':     { mode: 'yield_anchor', outcomeType: 'experiment', unitsFrom: 'fixed_1' },
+  // Only prototype-brief ever reports a nonzero units_generated (0 or 1) —
+  // prototype-wireframe may only ever report 0, for its own failure. This
+  // protects TWO counts computed in cost-tower-outcomes.js's buildOutcomeTypes():
+  // units (summed across a type's callers) AND attempts (summed the same way,
+  // filtered on non-null). If both callers ever reported 1 on the same
+  // successful attempt, one real prototype would double-count as 2 in BOTH
+  // figures. See scripts/prototype-canvas.js's _pcReportUnitsGenerated() call
+  // sites for the enforcing code.
+  'prototype-wireframe':       { mode: 'yield_anchor', outcomeType: 'prototype', unitsFrom: 'prototypes' },
+  'prototype-brief':           { mode: 'yield_anchor', outcomeType: 'prototype', unitsFrom: 'prototypes' },
+
+  'doc-summary':               { mode: 'attachable_support' },
+
+  'sc-add-feat-hyp-gen':       { mode: 'general_usage_only' }
+
+  // Everything else not listed here also defaults to general_usage_only —
+  // see _resolveOutcomeId()'s fallback below.
+};
+
+// Thin wrapper over mt_outcome_get_or_create_active — calls the RPC and
+// nothing else. Does NOT re-derive the abandonment-window check in
+// JavaScript; that logic lives in exactly one place, the SQL function.
+// Never throws — an outcome-attribution failure must never block the AI
+// response, same discipline as _insertAiUsageEvent() itself. Returns null
+// on any failure, which _insertAiUsageEvent() already treats as a valid
+// "unattributed" outcome_id.
+async function _getOrCreateActiveOutcome(companyId, sessionId, outcomeTypeId, productId, userId) {
+  if (!supabaseAdmin || !sessionId) return null;
+  try {
+    const { data, error } = await supabaseAdmin.rpc('mt_outcome_get_or_create_active', {
+      p_company_id: companyId,
+      p_session_id: sessionId,
+      p_outcome_type_id: outcomeTypeId,
+      p_product_id: productId,
+      p_user_id: userId
+    });
+    if (error) {
+      console.warn('[OUTCOME] get_or_create_active failed:', outcomeTypeId, error.message);
+      return null;
+    }
+    return data || null;
+  } catch (e) {
+    console.warn('[OUTCOME] get_or_create_active exception:', outcomeTypeId, e.message);
+    return null;
+  }
+}
+
+// Thin wrapper over mt_outcome_attach_support — finds the most recent
+// session_sum outcome of any type in this session (in_progress or
+// completed), per the post-completion attachment rule. Returns null if none
+// exists, which the caller treats as "fall through to general_usage_only,"
+// not an error.
+async function _attachSupportOutcome(sessionId) {
+  if (!supabaseAdmin || !sessionId) return null;
+  try {
+    const { data, error } = await supabaseAdmin.rpc('mt_outcome_attach_support', {
+      p_session_id: sessionId
+    });
+    if (error) {
+      console.warn('[OUTCOME] attach_support failed:', error.message);
+      return null;
+    }
+    return data || null;
+  } catch (e) {
+    console.warn('[OUTCOME] attach_support exception:', e.message);
+    return null;
+  }
+}
+
+// Mode dispatch — the single place CALLER_ATTRIBUTION_MODE gets read to
+// decide outcome_id for a given call. Any caller not in the map (or an
+// unrecognized mode) resolves to general_usage_only (null), same as
+// yield_anchor — a deliberate default, not a missing entry.
+async function _resolveOutcomeId(caller, sessionId, companyId, productId, userId) {
+  const rule = CALLER_ATTRIBUTION_MODE[caller] || { mode: 'general_usage_only' };
+  if (rule.mode === 'session_sum_anchor') {
+    return await _getOrCreateActiveOutcome(companyId, sessionId, rule.outcomeType, productId, userId);
+  }
+  if (rule.mode === 'attachable_support') {
+    return await _attachSupportOutcome(sessionId);
+  }
+  return null; // yield_anchor / general_usage_only
+}
+
+// units_generated at insert time — corrected architecture (Phase 1 finding):
+// the proxy never parses a caller's domain JSON (its own reply to the client
+// is the raw text string, never a parsed object), so it cannot count
+// "how many capabilities/stories/etc were in the response" here. The only
+// thing genuinely known at insert time, with no parse required, is whether
+// the call failed — plus one more case added during Phase 4/5 review:
+// unitsFrom==='fixed_1' callers are constant by construction (exactly 1 unit
+// on success, regardless of response content), so they never needed a parse
+// to know their count either. Real array-counted callers still resolve to
+// null on success — their count arrives later via
+// POST /api/usage-events/units-generated, called by the frontend immediately
+// after it parses its own response (Phase 6, not yet wired).
+function _resolveUnitsGeneratedAtInsert(caller, callStatus) {
+  const rule = CALLER_ATTRIBUTION_MODE[caller];
+  if (!rule || rule.mode !== 'yield_anchor') return null; // not applicable outside Yield callers
+  if (callStatus === 'error' || callStatus === 'timeout') return 0; // known failure, no parse needed
+  if (rule.unitsFrom === 'fixed_1') return 1; // constant by construction, no parse needed either
+  return null; // array-counted caller, success — real count arrives later via the new endpoint
+}
+
 // ── Budget-alert opportunistic check (v9.28.01) ──────────────────────────────
 // No cron infrastructure exists in this app (AI Cost Control Tower spec,
 // Section 6.6) — piggybacked onto the highest-frequency write this app
@@ -209,6 +374,28 @@ const MONTH_TO_DATE_SPEND_ROW_CAP = 20000;
 function _utcMonthBoundary(offsetMonths) {
   var d = new Date();
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + offsetMonths, 1));
+}
+
+// Shared "is this effective-dated row active at time T" predicate — used by
+// both _computeMonthToDateSpend() below (historical event timestamps) and
+// _resolveEconomicalModel() further down (the current moment), so the two
+// can't silently disagree about which pricing row applies to the same
+// provider+model at the same point in time.
+function _isPriceRowActiveAt(atMs, fromMs, toMs) {
+  return atMs >= fromMs && (toMs === null || atMs < toMs);
+}
+
+// Shared "the active overall budget row for this company" lookup — used by
+// both _checkBudgetAlertsOpportunistic() and _checkGovernanceState() below,
+// so the definition of "the active budget" can't drift between the two.
+function _fetchActiveBudget(companyId, selectCols) {
+  return supabaseAdmin
+    .from('mt_ai_budgets')
+    .select(selectCols)
+    .eq('company_id', companyId)
+    .eq('scope_type', 'overall')
+    .eq('is_active', true)
+    .maybeSingle();
 }
 
 // Recomputes calculated_cost the same way mt_ai_cost_events_list() does
@@ -269,7 +456,7 @@ async function _computeMonthToDateSpend(companyId) {
     if (!candidates) continue; // unpriced call — excluded, same as the RPC's LEFT JOIN + NULL calculated_cost
     const atMs = new Date(e.request_started_at).getTime();
     const match = candidates.find(function(p) {
-      return atMs >= p.effectiveFromMs && (p.effectiveToMs === null || atMs < p.effectiveToMs);
+      return _isPriceRowActiveAt(atMs, p.effectiveFromMs, p.effectiveToMs);
     });
     if (!match) continue;
     total += (e.input_tokens || 0) / 1000000 * match.input_price_per_mtok
@@ -287,13 +474,7 @@ async function _checkBudgetAlertsOpportunistic(companyId) {
   if (Date.now() - lastChecked < BUDGET_ALERT_CHECK_THROTTLE_MS) return;
   _budgetAlertLastCheckedAt.set(companyId, Date.now());
 
-  const { data: budget, error: budgetErr } = await supabaseAdmin
-    .from('mt_ai_budgets')
-    .select('*')
-    .eq('company_id', companyId)
-    .eq('scope_type', 'overall')
-    .eq('is_active', true)
-    .maybeSingle();
+  const { data: budget, error: budgetErr } = await _fetchActiveBudget(companyId, '*');
   if (budgetErr || !budget) return; // no active budget configured — nothing to check against
 
   const spend = await _computeMonthToDateSpend(companyId);
@@ -326,6 +507,102 @@ async function _checkBudgetAlertsOpportunistic(companyId) {
     if (error && error.code !== '23505') {
       console.warn('[AI BUDGET ALERT] alert insert failed:', error.message);
     }
+  }
+}
+
+// ── Manual governance enforcement (v9.28.02) ─────────────────────────────────
+// Deliberately not the same hook as _checkBudgetAlertsOpportunistic() above:
+// that check is a passive, throttled, fire-and-forget notification about a
+// call that already happened. This one decides whether a call happens at
+// all, so it must be awaited, must run on every request, and must run
+// before dispatch, not after. An admin's Restrict/Stop selection
+// (scripts/cost-tower.js's actSaveBudget()) IS the live governance state
+// the moment it's saved — this applies it.
+// Auto-reverts to 'notify' once action_on_breach_set_at falls before the
+// start of the current UTC month, computed via the same _utcMonthBoundary()
+// helper _checkBudgetAlertsOpportunistic() already uses above, not a second
+// definition of "current month" that could drift from it. A NULL timestamp
+// paired with a non-'notify' value is treated as already-expired, not as
+// "never expires" — a restriction with no recorded time is not trusted to
+// enforce indefinitely.
+// See the restrict_tier branch in the /api/anthropic handler for why this
+// exists: a conservative safe floor, not a verified per-model ceiling.
+const GOVERNANCE_RESTRICT_MAX_TOKENS_CAP = 4096;
+
+async function _checkGovernanceState(companyId) {
+  if (!supabaseAdmin || !companyId) return { action: 'notify' };
+
+  let budget;
+  try {
+    const { data, error } = await _fetchActiveBudget(companyId, 'budget_id, action_on_breach, action_on_breach_set_at');
+    if (error) throw error;
+    budget = data;
+  } catch (e) {
+    // Fail open: this feature must never be the reason AI generation goes
+    // down company-wide over an unrelated hiccup in a table nobody's AI
+    // call actually needs to succeed.
+    console.warn('[AI GOVERNANCE] budget lookup failed, proceeding as notify:', e.message);
+    return { action: 'notify' };
+  }
+  if (!budget) return { action: 'notify' }; // nothing configured — nothing to enforce
+  if (budget.action_on_breach === 'notify') return { action: 'notify' };
+
+  const monthStartMs = _utcMonthBoundary(0).getTime();
+  const setAtMs = budget.action_on_breach_set_at ? new Date(budget.action_on_breach_set_at).getTime() : null;
+  const isExpired = setAtMs === null || setAtMs < monthStartMs;
+  if (!isExpired) return { action: budget.action_on_breach };
+
+  // Expired — this request is treated as 'notify', and the row is
+  // opportunistically corrected in the background so the admin's own
+  // Budget Configuration card stops showing a restriction that's no longer
+  // enforced. Never awaited: this write must never delay or fail the AI
+  // call itself, same discipline as every other fire-and-forget write in
+  // this file.
+  // Compare-and-swap on the exact action_on_breach_set_at value just read
+  // (not just budget_id + non-'notify'): without this, a fresh admin save
+  // that lands between this read and this write's arrival — same non-
+  // 'notify' value, new timestamp — would still match on budget_id alone
+  // and get silently reverted back to 'notify' by this stale write.
+  let _revertQuery = supabaseAdmin
+    .from('mt_ai_budgets')
+    .update({ action_on_breach: 'notify' })
+    .eq('budget_id', budget.budget_id)
+    .neq('action_on_breach', 'notify');
+  _revertQuery = budget.action_on_breach_set_at
+    ? _revertQuery.eq('action_on_breach_set_at', budget.action_on_breach_set_at)
+    : _revertQuery.is('action_on_breach_set_at', null);
+  _revertQuery
+    .then(function(r) { if (r.error) console.warn('[AI GOVERNANCE] revert-to-notify write failed:', r.error.message); })
+    .catch(function(e) { console.warn('[AI GOVERNANCE] revert-to-notify write exception:', e.message); });
+  return { action: 'notify' };
+}
+
+// Economical-tier model for a provider, active right now. Sourced from
+// mt_model_pricing.tier (already populated per-provider by v1's own
+// migration) rather than duplicating TIER_MODEL_BY_PROVIDER from
+// scripts/api.js into the proxy, which would create a second place that
+// can drift from the first. Mirrors _computeMonthToDateSpend()'s own
+// effective_from/effective_to window match above (JS-side filtering over
+// the fetched rows), applied to "now" instead of a historical event
+// timestamp, rather than introducing a second date-filtering approach.
+async function _resolveEconomicalModel(provider) {
+  try {
+    const { data: rows, error } = await supabaseAdmin
+      .from('mt_model_pricing')
+      .select('model_name, effective_from, effective_to')
+      .eq('provider', provider)
+      .eq('tier', 'economical');
+    if (error || !rows || !rows.length) return null;
+    const nowMs = Date.now();
+    const match = rows.find(function(p) {
+      const fromMs = new Date(p.effective_from).getTime();
+      const toMs = p.effective_to ? new Date(p.effective_to).getTime() : null;
+      return _isPriceRowActiveAt(nowMs, fromMs, toMs);
+    });
+    return match ? match.model_name : null;
+  } catch (e) {
+    console.warn('[AI GOVERNANCE] economical-tier lookup failed:', e.message);
+    return null;
   }
 }
 
@@ -503,6 +780,39 @@ const teamLimiter = rateLimit({
 app.use('/api/team', teamLimiter);
 app.use('/api/team', express.json({ limit: '10kb' }));
 app.use('/api/team', requireAuthStrict);
+
+// ── Outcome-Based Cost — units-generated report-back (AI Cost Control Tower v2)
+// Separate limiter instance, same config, own counter — same convention as
+// every other route in this file.
+const usageEventsLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MIN * 60 * 1000,
+  max: RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(200).json({
+      error: {
+        type: 'rate_limit_error',
+        message: `Too many requests — limit is ${RATE_LIMIT_MAX} per ${RATE_LIMIT_WINDOW_MIN === 1 ? 'minute' : RATE_LIMIT_WINDOW_MIN + ' minutes'}. Please wait and try again.`
+      }
+    });
+  }
+});
+app.options('/api/usage-events/units-generated', cors(corsOptions));
+app.use('/api/usage-events/units-generated', usageEventsLimiter);
+app.use('/api/usage-events/units-generated', requireAuthStrict);
+app.use('/api/usage-events/units-generated', express.json({ limit: '1kb' }));
+app.use('/api/usage-events/units-generated', requireActiveCompanyMember);
+
+// ── Outcome-Based Cost — caller-modes lookup (AI Cost Control Tower v2) ──────
+// server.js is the only place CALLER_ATTRIBUTION_MODE is hand-typed — the
+// frontend fetches this endpoint once per tab load instead of hand-typing a
+// second copy that could drift from this one. GET, no body, no company
+// scoping needed (this is a static code constant, not tenant data) — same
+// treatment as /api/embed-info.
+app.options('/api/outcome-caller-modes', cors(corsOptions));
+app.use('/api/outcome-caller-modes', usageEventsLimiter);
+app.use('/api/outcome-caller-modes', requireAuthStrict);
 
 // requireCompanyAdmin — the single authorization boundary for every team route.
 // These routes use the service-role client and bypass RLS entirely by design,
@@ -823,7 +1133,7 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
 // currently only ever sent by Requirement Agent when its localStorage
 // streaming flag is on — see scripts/requirement-agent.js).
 async function _handleStreamingRequest(req, res, ctx) {
-  const { provider, adapter, upstreamReq, _caller, body, _requestStartedAt, _clientCallId, _sessionId, _sessionType, _productId, _userRoleAtCall, _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS } = ctx;
+  const { provider, adapter, upstreamReq, _caller, body, _requestStartedAt, _clientCallId, _sessionId, _sessionType, _productId, _userRoleAtCall, _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS, _outcomeId } = ctx;
   upstreamReq.body.stream = true;
 
   let _attempt = 0;
@@ -859,7 +1169,9 @@ async function _handleStreamingRequest(req, res, ctx) {
         error_type: outcome.midStreamError ? 'stream_interrupted' : null,
         failure_phase: outcome.midStreamError ? 'outbound_call' : null,
         request_started_at: _requestStartedAt.toISOString(), duration_ms: _durationMs,
-        request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes
+        request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes,
+        outcome_id: _outcomeId,
+        units_generated: _resolveUnitsGeneratedAtInsert(_caller, outcome.midStreamError ? 'error' : 'success')
       });
       return; // res already ended inside _streamUpstreamOnce
     }
@@ -883,7 +1195,9 @@ async function _handleStreamingRequest(req, res, ctx) {
       provider_usage_raw: null, status: 'error', provider_http_status: outcome.httpStatus,
       error_type: _errVerdict.normalizedErrorCode, failure_phase: 'outbound_call',
       request_started_at: _requestStartedAt.toISOString(), duration_ms: _durationMs,
-      request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes
+      request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes,
+      outcome_id: _outcomeId,
+      units_generated: _resolveUnitsGeneratedAtInsert(_caller, 'error')
     });
     return res.status(200).json({ error: { type: _errVerdict._rawType || _errVerdict.normalizedErrorCode, message: _errVerdict.safeErrorMessage } });
   }
@@ -891,6 +1205,16 @@ async function _handleStreamingRequest(req, res, ctx) {
 
 // ── Main proxy endpoint ───────────────────────────────────────────────────────
 app.post('/api/anthropic', async (req, res) => {
+  // Hoisted above the try — a const/let declared inside a try block is a
+  // separate block scope from its sibling catch block and is never visible
+  // there regardless of assignment timing (typeof on it inside catch always
+  // reads 'undefined', never the real value, and never throws either, which
+  // is what let this go unnoticed). Every `typeof X !== 'undefined'` guard
+  // in the catch block below was silently always false before this fix,
+  // making the entire error/timeout-path usage-tracking insert dead code.
+  let _requestStartedAt, _clientCallId, _sessionId, _settingsMode, _settingsModel,
+      _selectionRule, _promptVersion, _productId, _sessionType, _userRoleAtCall,
+      _outcomeId, _caller, bodyBytes;
   try {
     // v9.14: provider is resolved server-side by requireActiveCompanyMember
     // above (req.resolvedProvider) — NEVER taken from body.provider, which
@@ -934,6 +1258,63 @@ app.post('/api/anthropic', async (req, res) => {
       });
     }
 
+    // ── Manual governance enforcement (v9.28.02) ──
+    // Runs before isKnownModel()/buildUpstreamRequest() below, so a Stop
+    // response never reaches either, and a Restrict substitution is in
+    // place before both see body.model. Overrides whatever body.model the
+    // client sent for any reason — an optimized default, a user's own
+    // explicit pin, or the batch_threshold_override path in
+    // feature-canvas.js — there is no per-call-site exemption here, the
+    // block/substitution happens before any of those distinctions are read.
+    const _governance = await _checkGovernanceState(req.companyId);
+    if (_governance.action === 'stop') {
+      return res.status(200).json({
+        error: {
+          type: 'usage_stopped',
+          message: 'AI generation is stopped for the rest of this billing period. An admin restricted usage after spend crossed budget.'
+        }
+      });
+    }
+    if (_governance.action === 'restrict_tier') {
+      const _econModel = await _resolveEconomicalModel(provider);
+      // isKnownModel() re-check: mt_model_pricing.tier (SQL-editable) and
+      // MODEL_CATALOG_BY_PROVIDER (hardcoded here) have no link keeping
+      // them in sync — if a tier-tagged model has since dropped out of the
+      // catalog, treat that exactly like "no economical row found" (fail
+      // open) rather than letting a stale tier tag fail the call closed at
+      // the isKnownModel() check just below.
+      if (_econModel && isKnownModel(provider, _econModel)) {
+        // Silent substitution, not a rejection — matches whether or not
+        // the client's original body.model was already the economical
+        // model. selection_rule is overwritten too, so Selection Economics
+        // (Cost Control Tower) attributes this call to the admin
+        // restriction instead of whatever routing the client computed.
+        body.model = _econModel;
+        body.selection_rule = 'governance_restricted';
+        // Conservative safe floor, not a per-model verified ceiling — this
+        // codebase has no per-model max-output-tokens table
+        // (MODEL_CATALOG_BY_PROVIDER is name-only). Caps a caller's
+        // original max_tokens (which may have been tuned for a larger
+        // model, e.g. pi-planning.js/market-intelligence.js) so a
+        // restricted call degrades gracefully instead of risking an
+        // upstream invalid_request_error from exceeding the economical
+        // model's real ceiling.
+        if (typeof body.max_tokens === 'number' && body.max_tokens > GOVERNANCE_RESTRICT_MAX_TOKENS_CAP) {
+          body.max_tokens = GOVERNANCE_RESTRICT_MAX_TOKENS_CAP;
+        }
+      } else {
+        // No economical-tier row for this provider today, or its tagged
+        // model isn't in this file's known-model catalog — fail open:
+        // proceed with the client's original body.model unchanged, never
+        // block the call or forward a null/invalid model string upstream.
+        if (_econModel) {
+          console.warn('[AI GOVERNANCE] economical-tier model not in known catalog, proceeding with original model:', provider, _econModel);
+        } else {
+          console.warn('[AI GOVERNANCE] no economical-tier pricing row for provider, proceeding with original model:', provider);
+        }
+      }
+    }
+
     // ── Runtime model validation (Section 6.3's fail-fast requirement) ──
     // Reject an unrecognized model for the resolved provider BEFORE spending
     // an upstream call on it — a stale client cache or tampered request
@@ -947,7 +1328,7 @@ app.post('/api/anthropic', async (req, res) => {
       });
     }
 
-    const _caller = body._caller || 'unknown';
+    _caller = body._caller || 'unknown';
     const upstreamReq = adapter.buildUpstreamRequest({
       model:      body.model,
       max_tokens: body.max_tokens,
@@ -965,13 +1346,13 @@ app.post('/api/anthropic', async (req, res) => {
     // before the outbound call begins, so duration_ms and the pricing-lookup
     // timestamp both reflect the actual Anthropic call, not proxy overhead
     // from auth/membership checks that already ran before this point.
-    const _requestStartedAt = new Date();
-    const _clientCallId = body.client_call_id || null;
-    const _sessionId    = body.session_id || null;
-    const _settingsMode  = body.settings_mode || null;
-    const _settingsModel = body.settings_model || null;
-    const _selectionRule = body.selection_rule || null;
-    const _promptVersion = body.prompt_version || null;
+    _requestStartedAt = new Date();
+    _clientCallId = body.client_call_id || null;
+    _sessionId    = body.session_id || null;
+    _settingsMode  = body.settings_mode || null;
+    _settingsModel = body.settings_model || null;
+    _selectionRule = body.selection_rule || null;
+    _promptVersion = body.prompt_version || null;
 
     // v9.13.01: product_id is now derived server-side from session_id ->
     // mt_sessions.product_id, NOT trusted from the client's body.product_id
@@ -985,14 +1366,14 @@ app.post('/api/anthropic', async (req, res) => {
     // client-sent body.product_id is kept ONLY as a fallback for the rare
     // caller with no session at all (e.g. doc-summary on a company-level
     // document) — never overriding a real session's own value.
-    let _productId = body.product_id || null;
+    _productId = body.product_id || null;
     // v9.15: session_type is set only by Guided Launch (session_type:'ChatCanvas'),
     // whose session_id points at mt_intake_sessions, not mt_sessions — the lookup
     // below would just miss and silently do nothing, but skipping it outright is
     // the correct behavior, not a fallback: body.product_id is already the real
     // value in that case (Guided Launch always knows its product directly, no
     // Discovery Map session exists yet to derive it from).
-    const _sessionType = body.session_type || null;
+    _sessionType = body.session_type || null;
     if (_sessionId && !_sessionType) {
       try {
         const { data: _sessRow } = await supabaseAdmin
@@ -1014,7 +1395,7 @@ app.post('/api/anthropic', async (req, res) => {
     // deserves its own scrutiny — out of scope for a telemetry addition.
     // Snapshotting here means later role changes never retroactively alter
     // what this historical row says the caller's role was at the time.
-    let _userRoleAtCall = null;
+    _userRoleAtCall = null;
     try {
       const { data: _roleRow } = await supabaseAdmin
         .from('mt_users_companies')
@@ -1025,6 +1406,19 @@ app.post('/api/anthropic', async (req, res) => {
       _userRoleAtCall = _roleRow ? _roleRow.role : null;
     } catch (e) {
       console.warn('[AI USAGE] role snapshot failed:', e.message);
+    }
+
+    // Outcome-Based Cost (AI Cost Control Tower v2) — resolved once per
+    // request, before the streaming/non-streaming split, so both paths use
+    // the same outcome_id rather than each risking its own separate
+    // get-or-create call. Never blocks the AI call on failure — degrades to
+    // null (unattributed), same discipline as the product_id/role lookups
+    // just above.
+    _outcomeId = null;
+    try {
+      _outcomeId = await _resolveOutcomeId(_caller, _sessionId, req.companyId, _productId, req.user.id);
+    } catch (e) {
+      console.warn('[OUTCOME] resolution failed:', e.message);
     }
 
     // v8.98: per-caller timeout — raising PI's ceiling should not tie up the
@@ -1044,7 +1438,8 @@ app.post('/api/anthropic', async (req, res) => {
       return await _handleStreamingRequest(req, res, {
         provider, adapter, upstreamReq, _caller, body, _requestStartedAt,
         _clientCallId, _sessionId, _sessionType, _productId, _userRoleAtCall,
-        _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS
+        _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS,
+        _outcomeId
       });
     }
 
@@ -1084,7 +1479,7 @@ app.post('/api/anthropic', async (req, res) => {
     }
 
     const { data, responseBytes, httpStatus, requestBytes } = _result;
-    const bodyBytes = requestBytes;
+    bodyBytes = requestBytes;
     const _durationMs = Date.now() - _requestStartedAt.getTime();
 
     // ── AI usage-tracking insert — success/response-received path (v9.13,
@@ -1135,7 +1530,9 @@ app.post('/api/anthropic', async (req, res) => {
       request_started_at: _requestStartedAt.toISOString(),
       duration_ms: _durationMs,
       request_bytes: bodyBytes,
-      response_bytes: responseBytes
+      response_bytes: responseBytes,
+      outcome_id: _outcomeId,
+      units_generated: _resolveUnitsGeneratedAtInsert(_caller, _isErrorPayload ? 'error' : 'success')
     });
 
     // v9.14: provider-neutral response envelope (Section 5.4) — the client's
@@ -1201,7 +1598,9 @@ app.post('/api/anthropic', async (req, res) => {
         request_started_at: _requestStartedAt.toISOString(),
         duration_ms: _durationMs,
         request_bytes: typeof bodyBytes !== 'undefined' ? bodyBytes : null,
-        response_bytes: null
+        response_bytes: null,
+        outcome_id: typeof _outcomeId !== 'undefined' ? _outcomeId : null,
+        units_generated: typeof _caller !== 'undefined' ? _resolveUnitsGeneratedAtInsert(_caller, isTimeout ? 'timeout' : 'error') : null
       });
     }
 
@@ -1253,6 +1652,72 @@ app.post('/api/check-company-name', async (req, res) => {
     console.error('[CHECK-COMPANY] exception:', err.message);
     return res.status(200).json({ exists: false, error: 'Check failed — proceeding as no match.' });
   }
+});
+
+// ── Outcome-Based Cost — units-generated report-back (AI Cost Control Tower v2)
+// Corrected architecture (Phase 1 finding, Section 2.3): the proxy never
+// parses a caller's domain JSON, so units_generated can't be computed at
+// insert time. Each Yield-type caller calls this immediately after it
+// successfully parses its own response, using client_call_id (already
+// generated client-side, already sent on the original /api/anthropic
+// request, already stored on that usage-event row) as the join key.
+// Idempotent by construction — WHERE units_generated IS NULL means a
+// retried or duplicated call is a no-op, not a corruption risk.
+// Request body is THREE fields, not two — company_id is required by the
+// requireActiveCompanyMember middleware in this route's chain (below) same
+// as every other /api/... route behind it, even though it's read there and
+// never mentioned again in this handler's own code. Phase 6 (wiring this
+// into the 13 Yield-caller success handlers) must send it: {client_call_id,
+// units_generated, company_id} — omitting it gets rejected by the
+// middleware with "company_id is required" before reaching this handler.
+app.post('/api/usage-events/units-generated', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(200).json({ error: { type: 'proxy_error', message: 'Server not configured for this check.' } });
+    }
+    const clientCallId = req.body && req.body.client_call_id;
+    const unitsGenerated = req.body ? req.body.units_generated : undefined;
+    if (!clientCallId || typeof unitsGenerated !== 'number' || unitsGenerated < 0) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'client_call_id (string), units_generated (integer >= 0), and company_id (checked by middleware before this point) are required.' } });
+    }
+    const { data, error } = await supabaseAdmin
+      .from('mt_ai_usage_events')
+      .update({ units_generated: Math.floor(unitsGenerated) })
+      .eq('client_call_id', clientCallId)
+      .eq('company_id', req.companyId)
+      .is('units_generated', null)
+      .select('client_call_id');
+    if (error) {
+      console.warn('[OUTCOME] units-generated update failed:', error.message);
+      return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not record units_generated.' } });
+    }
+    // No matching row is not an error — it's a legitimate no-op (already
+    // set by a prior call, or the client_call_id doesn't belong to this
+    // company). Same-shape response either way; the caller doesn't need to
+    // distinguish "updated" from "already set."
+    return res.status(200).json({ ok: true, updated: !!(data && data.length > 0) });
+  } catch (err) {
+    console.error('[OUTCOME] units-generated exception:', err.message);
+    return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not record units_generated.' } });
+  }
+});
+
+// Returns only the yield_anchor subset (caller name -> outcomeType) — the
+// frontend groups Yield rows by this lookup, and never needs the
+// session_sum_anchor / attachable_support entries at all (it groups those
+// rows by outcome_id instead, already present on mt_ai_cost_events_list()'s
+// rows). Computed fresh from the live constant on every call rather than
+// cached at startup — this is a tiny, rarely-called, in-memory object
+// filter, not worth adding cache-invalidation complexity for.
+app.get('/api/outcome-caller-modes', (req, res) => {
+  const yieldModes = {};
+  Object.keys(CALLER_ATTRIBUTION_MODE).forEach(function(caller) {
+    const rule = CALLER_ATTRIBUTION_MODE[caller];
+    if (rule.mode === 'yield_anchor') {
+      yieldModes[caller] = rule.outcomeType;
+    }
+  });
+  return res.status(200).json({ callerModes: yieldModes });
 });
 
 // ── Embeddings — Requirement Agent persistent-document RAG (v14) ─────────────
