@@ -167,7 +167,10 @@ const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
 async function _insertAiUsageEvent(fields) {
   if (!supabaseAdmin) return; // telemetry is best-effort; never block on missing config
   try {
-    const { error } = await supabaseAdmin.from('mt_ai_usage_events').insert(fields);
+    // app_id is NOT NULL post-migration; every event this proxy inserts is
+    // Product Studio's own, so it's stamped here once rather than at every
+    // caller's field-building site.
+    const { error } = await supabaseAdmin.from('mt_ai_usage_events').insert(Object.assign({ app_id: INGESTION_APP_ID }, fields));
     if (error) console.error('[AI USAGE] insert failed:', error.message);
   } catch (e) {
     console.error('[AI USAGE] insert exception:', e.message);
@@ -203,7 +206,20 @@ async function _insertAiUsageEvent(fields) {
 //   - general_usage_only (1): real spend, never attributed to any outcome
 //     type. Everything not listed here also falls through to this mode —
 //     see _resolveOutcomeId()'s fallback below, not a silent gap.
+// This proxy serves exactly one app's ingestion path today — named once
+// here rather than as a repeated inline literal, so a future multi-app
+// ingestion integration (out of scope per spec §9) has one place to change
+// instead of every call site that currently assumes Product Studio.
+const INGESTION_APP_ID = 'product-studio';
+
+// Multi-app platform extension: re-keyed from a flat caller->rule map to
+// app_id->caller->rule. A second app writing its own `caller` strings into
+// the same mt_ai_usage_events.caller column could otherwise collide with one
+// of these Product Studio names and silently misattribute usage to the
+// wrong outcome type. Every entry below is unchanged and still
+// Product-Studio-only; a future app gets its own top-level key here.
 const CALLER_ATTRIBUTION_MODE = {
+  [INGESTION_APP_ID]: {
   'requirement-agent':        { mode: 'session_sum_anchor', outcomeType: 'requirement_brief' },
   'dm-generate':              { mode: 'session_sum_anchor', outcomeType: 'discovery_map' },
   'mi-generate':              { mode: 'session_sum_anchor', outcomeType: 'market_intelligence_report' },
@@ -260,6 +276,7 @@ const CALLER_ATTRIBUTION_MODE = {
 
   // Everything else not listed here also defaults to general_usage_only —
   // see _resolveOutcomeId()'s fallback below.
+  }
 };
 
 // Thin wrapper over mt_outcome_get_or_create_active — calls the RPC and
@@ -269,11 +286,12 @@ const CALLER_ATTRIBUTION_MODE = {
 // response, same discipline as _insertAiUsageEvent() itself. Returns null
 // on any failure, which _insertAiUsageEvent() already treats as a valid
 // "unattributed" outcome_id.
-async function _getOrCreateActiveOutcome(companyId, sessionId, outcomeTypeId, productId, userId) {
+async function _getOrCreateActiveOutcome(appId, companyId, sessionId, outcomeTypeId, productId, userId) {
   if (!supabaseAdmin || !sessionId) return null;
   try {
     const { data, error } = await supabaseAdmin.rpc('mt_outcome_get_or_create_active', {
       p_company_id: companyId,
+      p_app_id: appId,
       p_session_id: sessionId,
       p_outcome_type_id: outcomeTypeId,
       p_product_id: productId,
@@ -316,10 +334,10 @@ async function _attachSupportOutcome(sessionId) {
 // decide outcome_id for a given call. Any caller not in the map (or an
 // unrecognized mode) resolves to general_usage_only (null), same as
 // yield_anchor — a deliberate default, not a missing entry.
-async function _resolveOutcomeId(caller, sessionId, companyId, productId, userId) {
-  const rule = CALLER_ATTRIBUTION_MODE[caller] || { mode: 'general_usage_only' };
+async function _resolveOutcomeId(appId, caller, sessionId, companyId, productId, userId) {
+  const rule = (CALLER_ATTRIBUTION_MODE[appId] || {})[caller] || { mode: 'general_usage_only' };
   if (rule.mode === 'session_sum_anchor') {
-    return await _getOrCreateActiveOutcome(companyId, sessionId, rule.outcomeType, productId, userId);
+    return await _getOrCreateActiveOutcome(appId, companyId, sessionId, rule.outcomeType, productId, userId);
   }
   if (rule.mode === 'attachable_support') {
     return await _attachSupportOutcome(sessionId);
@@ -339,8 +357,8 @@ async function _resolveOutcomeId(caller, sessionId, companyId, productId, userId
 // null on success — their count arrives later via
 // POST /api/usage-events/units-generated, called by the frontend immediately
 // after it parses its own response (Phase 6, not yet wired).
-function _resolveUnitsGeneratedAtInsert(caller, callStatus) {
-  const rule = CALLER_ATTRIBUTION_MODE[caller];
+function _resolveUnitsGeneratedAtInsert(appId, caller, callStatus) {
+  const rule = (CALLER_ATTRIBUTION_MODE[appId] || {})[caller];
   if (!rule || rule.mode !== 'yield_anchor') return null; // not applicable outside Yield callers
   if (callStatus === 'error' || callStatus === 'timeout') return 0; // known failure, no parse needed
   if (rule.unitsFrom === 'fixed_1') return 1; // constant by construction, no parse needed either
@@ -393,7 +411,7 @@ function _fetchActiveBudget(companyId, selectCols) {
     .from('mt_ai_budgets')
     .select(selectCols)
     .eq('company_id', companyId)
-    .eq('scope_type', 'overall')
+    .eq('app_id', INGESTION_APP_ID)
     .eq('is_active', true)
     .maybeSingle();
 }
@@ -415,6 +433,7 @@ async function _computeMonthToDateSpend(companyId) {
       .from('mt_ai_usage_events')
       .select('provider, requested_model, response_model, input_tokens, output_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, request_started_at')
       .eq('company_id', companyId)
+      .eq('app_id', INGESTION_APP_ID)
       .gte('request_started_at', monthStartIso)
       .limit(MONTH_TO_DATE_SPEND_ROW_CAP),
     supabaseAdmin
@@ -879,6 +898,44 @@ async function requireActiveCompanyMember(req, res, next) {
       console.warn('[AI] membership denied:', req.user.email, '->', companyId);
       return res.status(200).json({ error: { type: 'forbidden_error', message: "You don't have active access to this company." } });
     }
+
+    // Multi-app platform extension (spec §6): access='control_tower' must be
+    // enforced here, not just via the client-side redirect in main.js's
+    // _pgtResolveCompany() — a redirect alone is a real security gap if it's
+    // the only enforcement, since nothing stops a direct API call bypassing
+    // it. is_active_company_member() only returns a boolean with no source
+    // tracked in this repo, so this is a separate, additive query rather than
+    // a change to that RPC's own (unverifiable) body.
+    // Also selects `role` and `is_active` here: role is stashed on req for
+    // the later usage-tracking snapshot (this endpoint's highest-frequency
+    // query would otherwise re-select the identical row a second time
+    // further down this handler purely for that); is_active guards against
+    // a stale/disabled row's access value ever overriding an active one's
+    // if (user_id, company_id) is ever not unique.
+    // Fails open on a query error — same discipline as _checkGovernanceState()
+    // further down this file: an additional business-rule restriction must
+    // never be the reason AI generation goes down company-wide over an
+    // unrelated hiccup on this one query, unlike the membership check above
+    // (which fails closed, since that one gates identity/tenancy itself).
+    try {
+      const { data: memberRow, error: accessErr } = await supabaseAdmin
+        .from('mt_users_companies')
+        .select('role, access')
+        .eq('user_id', req.user.id)
+        .eq('company_id', companyId)
+        .eq('is_active', true)
+        .maybeSingle();
+      if (!accessErr && memberRow) {
+        req.roleAtCall = memberRow.role;
+        if (memberRow.access === 'control_tower') {
+          console.warn('[AI] control_tower-only access denied Product Studio generation:', req.user.email, '->', companyId);
+          return res.status(200).json({ error: { type: 'forbidden_error', message: "Control Tower access doesn't include Product Studio's AI generation features." } });
+        }
+      }
+    } catch (e) {
+      console.warn('[AI] access-tier check exception, proceeding (fail open):', e.message);
+    }
+
     // v9.13: preserved on req (not just deleted from body) so the AI usage-
     // tracking insert further down the handler has a trusted, server-verified
     // company_id to record against — mirrors requireCompanyAdmin's existing
@@ -1171,7 +1228,7 @@ async function _handleStreamingRequest(req, res, ctx) {
         request_started_at: _requestStartedAt.toISOString(), duration_ms: _durationMs,
         request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes,
         outcome_id: _outcomeId,
-        units_generated: _resolveUnitsGeneratedAtInsert(_caller, outcome.midStreamError ? 'error' : 'success')
+        units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, outcome.midStreamError ? 'error' : 'success')
       });
       return; // res already ended inside _streamUpstreamOnce
     }
@@ -1197,7 +1254,7 @@ async function _handleStreamingRequest(req, res, ctx) {
       request_started_at: _requestStartedAt.toISOString(), duration_ms: _durationMs,
       request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes,
       outcome_id: _outcomeId,
-      units_generated: _resolveUnitsGeneratedAtInsert(_caller, 'error')
+      units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, 'error')
     });
     return res.status(200).json({ error: { type: _errVerdict._rawType || _errVerdict.normalizedErrorCode, message: _errVerdict.safeErrorMessage } });
   }
@@ -1395,17 +1452,26 @@ app.post('/api/anthropic', async (req, res) => {
     // deserves its own scrutiny — out of scope for a telemetry addition.
     // Snapshotting here means later role changes never retroactively alter
     // what this historical row says the caller's role was at the time.
+    // requireActiveCompanyMember already selected this same row's role
+    // (for its own access-tier check) and stashed it on req.roleAtCall —
+    // reuse it instead of re-querying the identical row a second time on
+    // this endpoint's hot path. Only falls back to a fresh query if that
+    // didn't happen (e.g. the access-tier query itself failed open above).
     _userRoleAtCall = null;
-    try {
-      const { data: _roleRow } = await supabaseAdmin
-        .from('mt_users_companies')
-        .select('role')
-        .eq('user_id', req.user.id)
-        .eq('company_id', req.companyId)
-        .maybeSingle();
-      _userRoleAtCall = _roleRow ? _roleRow.role : null;
-    } catch (e) {
-      console.warn('[AI USAGE] role snapshot failed:', e.message);
+    if (req.roleAtCall !== undefined) {
+      _userRoleAtCall = req.roleAtCall;
+    } else {
+      try {
+        const { data: _roleRow } = await supabaseAdmin
+          .from('mt_users_companies')
+          .select('role')
+          .eq('user_id', req.user.id)
+          .eq('company_id', req.companyId)
+          .maybeSingle();
+        _userRoleAtCall = _roleRow ? _roleRow.role : null;
+      } catch (e) {
+        console.warn('[AI USAGE] role snapshot failed:', e.message);
+      }
     }
 
     // Outcome-Based Cost (AI Cost Control Tower v2) — resolved once per
@@ -1414,9 +1480,12 @@ app.post('/api/anthropic', async (req, res) => {
     // get-or-create call. Never blocks the AI call on failure — degrades to
     // null (unattributed), same discipline as the product_id/role lookups
     // just above.
+    // INGESTION_APP_ID — this proxy is Product Studio's own ingestion path;
+    // a future app's ingestion is a separate, out-of-scope integration
+    // (spec §9), not a value derived from anything on req here.
     _outcomeId = null;
     try {
-      _outcomeId = await _resolveOutcomeId(_caller, _sessionId, req.companyId, _productId, req.user.id);
+      _outcomeId = await _resolveOutcomeId(INGESTION_APP_ID, _caller, _sessionId, req.companyId, _productId, req.user.id);
     } catch (e) {
       console.warn('[OUTCOME] resolution failed:', e.message);
     }
@@ -1532,7 +1601,7 @@ app.post('/api/anthropic', async (req, res) => {
       request_bytes: bodyBytes,
       response_bytes: responseBytes,
       outcome_id: _outcomeId,
-      units_generated: _resolveUnitsGeneratedAtInsert(_caller, _isErrorPayload ? 'error' : 'success')
+      units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, _isErrorPayload ? 'error' : 'success')
     });
 
     // v9.14: provider-neutral response envelope (Section 5.4) — the client's
@@ -1600,7 +1669,7 @@ app.post('/api/anthropic', async (req, res) => {
         request_bytes: typeof bodyBytes !== 'undefined' ? bodyBytes : null,
         response_bytes: null,
         outcome_id: typeof _outcomeId !== 'undefined' ? _outcomeId : null,
-        units_generated: typeof _caller !== 'undefined' ? _resolveUnitsGeneratedAtInsert(_caller, isTimeout ? 'timeout' : 'error') : null
+        units_generated: typeof _caller !== 'undefined' ? _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, isTimeout ? 'timeout' : 'error') : null
       });
     }
 
@@ -1710,9 +1779,11 @@ app.post('/api/usage-events/units-generated', async (req, res) => {
 // cached at startup — this is a tiny, rarely-called, in-memory object
 // filter, not worth adding cache-invalidation complexity for.
 app.get('/api/outcome-caller-modes', (req, res) => {
+  const appId = (req.query && req.query.app_id) || INGESTION_APP_ID;
+  const modesForApp = CALLER_ATTRIBUTION_MODE[appId] || {};
   const yieldModes = {};
-  Object.keys(CALLER_ATTRIBUTION_MODE).forEach(function(caller) {
-    const rule = CALLER_ATTRIBUTION_MODE[caller];
+  Object.keys(modesForApp).forEach(function(caller) {
+    const rule = modesForApp[caller];
     if (rule.mode === 'yield_anchor') {
       yieldModes[caller] = rule.outcomeType;
     }
@@ -1900,7 +1971,7 @@ app.post('/api/team/list', async (req, res) => {
   try {
     const { data: rows, error } = await supabaseAdmin
       .from('mt_users_companies')
-      .select('user_id, role, is_active, joined_at')
+      .select('user_id, role, is_active, joined_at, access')
       .eq('company_id', req.companyId);
     if (error) {
       console.error('[TEAM] list query failed:', error.message);
@@ -1924,6 +1995,7 @@ app.post('/api/team/list', async (req, res) => {
           namePlaceholder,
           email: u.email || '',
           role: row.role,
+          access: row.access,
           status,
           is_self: row.user_id === req.user.id
         };
@@ -1940,6 +2012,63 @@ app.post('/api/team/list', async (req, res) => {
   }
 });
 
+// ── Cost Tower user-name resolution ── deliberately NOT under /api/team's
+// prefix, so it doesn't inherit requireCompanyAdmin. Cost Tower opened to
+// every active member regardless of role (this same multi-app platform
+// extension), but /api/team/list (used by actLoadTeamNames() before this
+// fix) stayed admin-gated -- a non-admin viewer got no names at all,
+// degrading to raw user ids. This route returns only {user_id, name}, never
+// email/role/access/status, gated on active membership alone (any role,
+// including control_tower -- Cost Tower is exactly who needs this).
+app.options('/api/cost-tower/team-names', cors(corsOptions));
+app.use('/api/cost-tower/team-names', teamLimiter);
+app.use('/api/cost-tower/team-names', express.json({ limit: '10kb' }));
+app.use('/api/cost-tower/team-names', requireAuthStrict);
+app.post('/api/cost-tower/team-names', async (req, res) => {
+  try {
+    const companyId = req.body && req.body.company_id;
+    if (!companyId) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'company_id is required.' } });
+    }
+    const { data: isMember, error: memberErr } = await supabaseAdmin.rpc('is_active_company_member', {
+      p_user_id: req.user.id, p_company_id: companyId
+    });
+    if (memberErr) {
+      console.error('[COST TOWER] team-names: membership check failed:', memberErr.message);
+      return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not load team names.' } });
+    }
+    if (!isMember) {
+      return res.status(200).json({ error: { type: 'forbidden_error', message: "You don't have active access to this company." } });
+    }
+
+    const { data: rows, error } = await supabaseAdmin
+      .from('mt_users_companies')
+      .select('user_id')
+      .eq('company_id', companyId);
+    if (error) {
+      console.error('[COST TOWER] team-names query failed:', error.message);
+      return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not load team names.' } });
+    }
+
+    const names = await Promise.all((rows || []).map(async function(row) {
+      try {
+        const { data: userData, error: userErr } = await supabaseAdmin.auth.admin.getUserById(row.user_id);
+        if (userErr || !userData || !userData.user) return null;
+        const u = userData.user;
+        const displayName = (u.user_metadata && u.user_metadata.display_name) || (u.email || '').split('@')[0];
+        return { user_id: row.user_id, name: displayName };
+      } catch (e) {
+        return null;
+      }
+    }));
+
+    return res.status(200).json({ names: names.filter(Boolean) });
+  } catch (err) {
+    console.error('[COST TOWER] team-names exception:', err.message);
+    return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not load team names.' } });
+  }
+});
+
 // ── Invite ── Path A (new email) / Path B (already registered elsewhere)
 app.post('/api/team/invite', async (req, res) => {
   try {
@@ -1952,6 +2081,11 @@ app.post('/api/team/invite', async (req, res) => {
     // an EXISTING member is treated as a hard error, not a silent default.
     const _validInviteRoles = ['admin', 'member', 'readonly'];
     const role = (req.body && _validInviteRoles.includes(req.body.role)) ? req.body.role : 'member';
+    // Multi-app platform extension — mirrors role's own omitted/invalid
+    // default-silently behavior above, not set-access's hard-fail (see that
+    // route's comment for why the two differ intentionally).
+    const _validInviteAccess = ['full_suite', 'control_tower'];
+    const access = (req.body && _validInviteAccess.includes(req.body.access)) ? req.body.access : 'full_suite';
 
     if (!email) {
       return res.status(200).json({ error: { type: 'invalid_request', message: 'Email is required.' } });
@@ -2009,7 +2143,7 @@ app.post('/api/team/invite', async (req, res) => {
 
     const { error: insertErr } = await supabaseAdmin
       .from('mt_users_companies')
-      .insert({ user_id: targetUserId, company_id: req.companyId, role, is_active: true });
+      .insert({ user_id: targetUserId, company_id: req.companyId, role, access, is_active: true });
 
     if (insertErr) {
       if (insertErr.code === '23505') {
@@ -2077,6 +2211,51 @@ app.post('/api/team/set-role', async (req, res) => {
   } catch (err) {
     console.error('[TEAM] set-role exception:', err.message);
     return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not change role. Please try again.' } });
+  }
+});
+
+// ── Set access ── Full Suite / Control Tower Only — mirrors set-role's exact
+// validation shape (hard fail on an invalid value, do not silently coerce —
+// same reasoning as set-role's own comment: a garbled request naming an
+// existing member is a bug or an attack, not a normal default case).
+// team_set_access_safe deliberately carries no "last full-suite admin" guard
+// (§6a.4 confirmed Option A: Team Management stays reachable regardless of
+// access, so there is no invariant to protect) — self-change blocking still
+// belongs here in the route, not the RPC, mirroring set-role's real body.
+app.post('/api/team/set-access', async (req, res) => {
+  try {
+    const targetUserId = req.body && req.body.target_user_id;
+    const _validAccess = ['full_suite', 'control_tower'];
+    const newAccess = req.body && req.body.new_access;
+    if (typeof newAccess !== 'string' || !_validAccess.includes(newAccess)) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'Invalid access level specified.' } });
+    }
+    if (!targetUserId) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'target_user_id is required.' } });
+    }
+    if (targetUserId === req.user.id) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: "You can't change your own access here." } });
+    }
+    // No membership pre-check here, unlike set-role: team_set_access_safe
+    // carries no second guard (no "last full-suite admin" invariant, per
+    // §6a.4 Option A), so its only false-path is "not a member" — the RPC's
+    // own result already tells us that with no ambiguity to disambiguate,
+    // and no extra round-trip is needed to find out first.
+    const { data: ok, error } = await supabaseAdmin.rpc('team_set_access_safe', {
+      p_company_id: req.companyId, p_target_user: targetUserId, p_new_access: newAccess
+    });
+    if (error) {
+      console.error('[TEAM] set-access RPC failed:', error.message);
+      return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not change access. Please try again.' } });
+    }
+    if (!ok) {
+      return res.status(200).json({ error: { type: 'invalid_request', message: 'This person is no longer a member of this company.' } });
+    }
+    console.log('[TEAM] set-access:', req.user.email, '->', targetUserId, 'to', newAccess, 'company', req.companyId);
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('[TEAM] set-access exception:', err.message);
+    return res.status(200).json({ error: { type: 'proxy_error', message: 'Could not change access. Please try again.' } });
   }
 });
 
