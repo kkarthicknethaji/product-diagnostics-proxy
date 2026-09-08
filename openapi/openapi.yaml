@@ -47,9 +47,11 @@ info:
 
 servers:
   - url: https://product-diagnostics-proxy.onrender.com
-    description: Render (primary)
+    description: Production
+  - url: https://pgt-proxy-dev.onrender.com
+    description: Development — test integrations here first, against pgt-dev
   - url: https://aipmtoolkit-proxy-hfgjehfyejc9d4hd.centralus-01.azurewebsites.net
-    description: Azure App Service
+    description: Development — Azure App Service, alternate dev host
 
 security:
   - bearerAuth: []
