@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+  <title>AI Cost Control Tower — Ingestion API reference</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+  <!-- Relative, matching the spec's literal example — correct as long as
+       this page is actually reached at /docs/ (trailing slash) or by
+       opening this file directly from disk, both of which resolve
+       "openapi.yaml" to this file's own sibling. server.js redirects the
+       bare /docs (no trailing slash, what actOpenApiDocs() opens) to
+       /docs/ for exactly this reason — see that redirect's comment for
+       the bug this replaced (an earlier absolute-path version that only
+       worked through that one specific route and 404'd everywhere else,
+       including opening this file directly). -->
+  <redoc spec-url="openapi.yaml"></redoc>
+  <!-- Vendored locally, not loaded from cdn.jsdelivr.net — confirmed that
+       CDN is unreachable from this corporate network (TLS connect failure,
+       curl exit 35), the same class of external-request interference
+       already documented elsewhere in this codebase (scripts/api.js's
+       Netlify-Function-blocked-on-"anthropic" history). The npm registry
+       itself was reachable, so this file is the exact same
+       redoc@2.5.3 bundle, pulled via `npm pack redoc` instead of the CDN.
+       See redoc.standalone.js.LICENSE.txt alongside it for attribution. -->
+  <script src="redoc.standalone.js"></script>
+</body>
+</html>

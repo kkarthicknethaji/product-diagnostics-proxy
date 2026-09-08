@@ -1,0 +1,476 @@
+openapi: 3.0.3
+info:
+  title: AI Cost Control Tower — Ingestion API
+  version: "1.0.0"
+  license:
+    name: Internal use only — not for external distribution
+  description: |
+    ## Getting started
+
+    This API lets an internal HCLTech application write its own AI usage and
+    outcome events into the same Cost Control Tower tables Product Studio
+    already uses, so it can be traced, costed, and governed the same way.
+
+    **Registration is not self-service.** Contact the platform operator to
+    register your app and receive a credential — registration and credential
+    issuance are direct SQL/RPC, run manually, not exposed over HTTP
+    (see the spec's Section 3/4 for why).
+
+    **Credential handling.** Your API key is shown exactly once, at issuance
+    time. Move it into your own team's secrets manager immediately — it is
+    never stored in plaintext or recoverable after that point. Every request
+    authenticates with `Authorization: Bearer <api_key>`; `company_id` and
+    `app_id` are resolved from the credential server-side and are never
+    accepted as request fields.
+
+    ```bash
+    curl -X POST https://<ingestion-host>/v1/usage-events \
+      -H "Authorization: Bearer <your_api_key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "client_call_id": "a1b2c3d4-...",
+        "user_role_at_call": "engineer",
+        "caller": "my-app-feature-x",
+        "requested_model": "gpt-4o",
+        "status": "success",
+        "request_started_at": "2026-09-07T10:00:00Z"
+      }'
+    ```
+
+    ## API contract changelog
+    (Separate from the app's own CHANGELOG.md — this section tracks the
+    `/v1` contract itself.)
+
+    - **v1.0.0** — initial publication. `usage-events` (create, batch,
+      units-generated report-back, scoped read-back), `outcomes` (create,
+      complete), `outcome-types` (register, list), `company-apps/me`.
+
+servers:
+  - url: https://product-diagnostics-proxy.onrender.com
+    description: Render (primary)
+  - url: https://aipmtoolkit-proxy-hfgjehfyejc9d4hd.centralus-01.azurewebsites.net
+    description: Azure App Service
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: usage-events
+    description: Record and read back AI usage/spend events.
+  - name: outcomes
+    description: Create and complete outcome instances (a session's worth of related usage events).
+  - name: outcome-types
+    description: Register and list your app's own outcome taxonomy.
+  - name: company-apps
+    description: Self-check on your own credential.
+
+paths:
+  /v1/usage-events:
+    post:
+      operationId: createUsageEvents
+      tags: [usage-events]
+      summary: Record one or a batch of AI usage events
+      description: |
+        Accepts a single object or an array (batch cap 500 items). Each item
+        is validated and inserted independently — a single malformed item
+        never discards the rest of the batch. `company_id`/`app_id` are
+        resolved from the credential.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/UsageEventInput'
+                - type: array
+                  maxItems: 500
+                  items:
+                    $ref: '#/components/schemas/UsageEventInput'
+      responses:
+        '200':
+          description: |
+            Single-item request: a plain result object. Batch request: a
+            `results` array, one entry per submitted item, in submitted
+            order — `index` maps back to the item's position in the request
+            array. The request itself still returns 400 if it's structurally
+            invalid, independent of any individual item's validity.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/IngestResult'
+                  - $ref: '#/components/schemas/BatchIngestResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    get:
+      operationId: listUsageEvents
+      tags: [usage-events]
+      summary: Read back your own submitted usage events
+      description: |
+        Reconciliation, not a dashboard replacement. Returns only the
+        caller's own events (scoped by the credential-resolved
+        `company_id`/`app_id`), including a computed `calculated_cost` per
+        event. Ordered `request_started_at DESC, id DESC`.
+      parameters:
+        - name: start
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: end
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 200, minimum: 1, maximum: 1000 }
+        - name: cursor
+          in: query
+          required: false
+          description: |
+            Opaque to the caller — a base64-encoded `(request_started_at,
+            id)` tuple of the last row in the prior page. Pass back the
+            `next_cursor` value from a previous response verbatim.
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/UsageEventRecord'
+                  next_cursor:
+                    type: string
+                    nullable: true
+                    description: Pass as `cursor` to fetch the next page. Null when this is the last page.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/usage-events/{client_call_id}/units-generated:
+    patch:
+      operationId: reportUnitsGenerated
+      tags: [usage-events]
+      summary: Report a variable unit count after parsing your own response
+      description: |
+        Idempotent, scoped to `(company_id, app_id, client_call_id)`. Only
+        meaningful for `yield_ratio`-costed outcome types — constant-per-call
+        counts should go on the initial write instead.
+      parameters:
+        - name: client_call_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [units_generated]
+              properties:
+                units_generated: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  units_generated: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/outcomes:
+    post:
+      operationId: createOutcome
+      tags: [outcomes]
+      summary: Start an outcome
+      description: |
+        Always a plain create — never silently hands back an existing
+        resource on its own. `client_outcome_id` is your own idempotency
+        key (same role as `client_call_id` on usage events) and is
+        mandatory, so retry-safety isn't something you have to opt into.
+        Server sets `status='in_progress'`, `started_at`, `last_activity_at`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome_type_id, client_outcome_id, session_id]
+              properties:
+                outcome_type_id: { type: string, description: "Must already be registered via POST /v1/outcome-types" }
+                client_outcome_id: { type: string, format: uuid }
+                session_id: { type: string, format: uuid }
+                user_id: { type: string, format: uuid, nullable: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outcome_id: { type: string, format: uuid }
+                  deduplicated:
+                    type: boolean
+                    description: "true if this client_outcome_id was already recorded — the returned outcome_id is the original, not a new one."
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/outcomes/{id}:
+    patch:
+      operationId: completeOutcome
+      tags: [outcomes]
+      summary: Mark an outcome completed
+      description: |
+        Ownership-checked: the outcome must belong to the credential-resolved
+        `(company_id, app_id)` and currently be `in_progress`. Returns 404
+        without distinguishing "doesn't exist," "belongs to someone else,"
+        or "already completed" — a 404 never confirms which UUIDs are real
+        for a caller that doesn't own them.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [completed] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outcome_id: { type: string, format: uuid }
+                  status: { type: string, enum: [completed] }
+                  completed_at: { type: string, format: date-time }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/outcome-types:
+    post:
+      operationId: registerOutcomeType
+      tags: [outcome-types]
+      summary: Register (or confirm) an outcome type
+      description: |
+        Idempotent upsert — but "idempotent" only means safe to resubmit
+        IDENTICAL values. Re-registering an existing `outcome_type_id` with
+        a different `costing_method` or `unit_label` is rejected with 409,
+        not silently applied. Register a new `outcome_type_id` instead if
+        your taxonomy genuinely changes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutcomeTypeInput'
+      responses:
+        '200':
+          description: Created, or an identical resubmission (no-op).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outcome_type_id: { type: string }
+                  status: { type: string, enum: [created, unchanged] }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: outcome_type_id already registered with a different costing_method or unit_label.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+    get:
+      operationId: listOutcomeTypes
+      tags: [outcome-types]
+      summary: List your own registered outcome types
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outcome_types:
+                    type: array
+                    items: { $ref: '#/components/schemas/OutcomeTypeInput' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/company-apps/me:
+    get:
+      operationId: getCredentialStatus
+      tags: [company-apps]
+      summary: Self-check on your own credential
+      description: Never returns credential_hash.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  company_id: { type: string, format: uuid }
+                  app_id: { type: string }
+                  is_active: { type: boolean }
+                  credential_created_at: { type: string, format: date-time }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The API key issued to your app, as a Bearer token.
+
+  responses:
+    BadRequest:
+      description: Malformed payload
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    Unauthorized:
+      description: Missing, invalid, or inactive credential
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    NotFound:
+      description: Referenced resource doesn't exist (or doesn't belong to the caller)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  schemas:
+    ErrorBody:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            type: { type: string }
+            message: { type: string }
+
+    IngestResult:
+      type: object
+      properties:
+        id: { type: string }
+        deduplicated: { type: boolean }
+
+    BatchIngestResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            oneOf:
+              - type: object
+                required: [index, id, deduplicated]
+                properties:
+                  index: { type: integer }
+                  id: { type: string }
+                  deduplicated: { type: boolean }
+              - type: object
+                required: [index, error]
+                properties:
+                  index: { type: integer }
+                  error: { $ref: '#/components/schemas/ErrorBody' }
+
+    UsageEventInput:
+      type: object
+      required: [client_call_id, user_role_at_call, caller, requested_model, status, request_started_at]
+      properties:
+        client_call_id: { type: string, format: uuid, description: "Your own UUID, idempotency key" }
+        provider: { type: string, default: anthropic }
+        product_id: { type: string, format: uuid, nullable: true, description: "Omit for non-Product-Studio apps" }
+        session_id: { type: string, nullable: true, description: "Your own stable identifier grouping related actions" }
+        user_id: { type: string, nullable: true, description: "Plain UUID, no FK, use your own internal identifier" }
+        user_role_at_call: { type: string, description: "Free text, open" }
+        caller: { type: string, description: "Your own internal name for what triggered this call" }
+        requested_model: { type: string }
+        response_model: { type: string, nullable: true }
+        settings_mode:
+          type: string
+          nullable: true
+          description: "Defaults to 'external' if omitted. Only set explicitly if a Product-Studio-internal value genuinely applies."
+        selection_rule:
+          type: string
+          nullable: true
+          description: "Same default behavior as settings_mode."
+        input_tokens: { type: integer, nullable: true }
+        output_tokens: { type: integer, nullable: true }
+        cache_creation_5m_tokens: { type: integer, nullable: true }
+        cache_creation_1h_tokens: { type: integer, nullable: true }
+        cache_read_tokens: { type: integer, nullable: true }
+        provider_usage_raw: { type: object, nullable: true, description: "jsonb escape hatch" }
+        status: { type: string, enum: [success, error, timeout] }
+        provider_http_status: { type: integer, nullable: true }
+        error_type: { type: string, nullable: true }
+        failure_phase: { type: string, nullable: true, description: "Product-Studio-specific enum, leave null if it doesn't apply" }
+        request_started_at: { type: string, format: date-time }
+        duration_ms: { type: integer, nullable: true }
+        request_bytes: { type: integer, nullable: true }
+        response_bytes: { type: integer, nullable: true }
+        outcome_id: { type: string, format: uuid, nullable: true, description: "Set if this event belongs to an outcome created via /v1/outcomes" }
+        units_generated: { type: integer, nullable: true, description: "Only meaningful for yield_ratio-costed outcome types" }
+
+    UsageEventRecord:
+      allOf:
+        - $ref: '#/components/schemas/UsageEventInput'
+        - type: object
+          properties:
+            id: { type: string }
+            calculated_cost:
+              type: number
+              nullable: true
+              description: "Null when no matching mt_model_pricing row was found for this provider/model/date."
+
+    OutcomeTypeInput:
+      type: object
+      required: [outcome_type_id, name, description, canvas, costing_method, unit_label]
+      properties:
+        outcome_type_id: { type: string, description: "Your own taxonomy key" }
+        name: { type: string }
+        description: { type: string }
+        canvas: { type: string, description: "General feature-or-origin label for non-Product-Studio apps" }
+        costing_method: { type: string, enum: [session_sum, yield_ratio] }
+        unit_label: { type: string, description: "Noun matching units_generated" }
+        abandonment_window_hrs: { type: integer, nullable: true, description: "Hours of inactivity before auto-flagged abandoned" }
