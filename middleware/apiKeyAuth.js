@@ -15,7 +15,10 @@
 // write (sql/ai-cost-tower-openapi-ingestion-credential-functions.sql).
 // Attaches req.companyId/req.appId, mirroring the existing req.companyId
 // convention from requireActiveCompanyMember, so downstream route code reads
-// the same shape regardless of which auth path resolved it.
+// the same shape regardless of which auth path resolved it. Also attaches
+// req.scopes/req.payloadCaptureEnabled (AI Trace Layer — Payload Capture
+// Infrastructure, ai-trace-layer-payload-infra-followup-spec-v0.7.md) —
+// same query, additional columns selected, not a second round-trip.
 //
 // Exported as a factory (not a bare middleware function) because it needs
 // server.js's existing supabaseAdmin client — server.js doesn't export that
@@ -76,17 +79,48 @@ module.exports = function apiKeyAuthFactory(supabaseAdmin) {
     const presentedHash = crypto.createHash('sha256').update(presentedKey).digest('hex');
 
     let row;
+    let scopeColumnsAvailable = true;
     try {
       const { data, error } = await supabaseAdmin
         .from('mt_company_apps')
-        .select('company_id, app_id, is_active')
+        .select('company_id, app_id, is_active, scope_usage_write, scope_traces_write, scope_payloads_write, payload_capture_enabled')
         .eq('credential_hash', presentedHash)
         .maybeSingle();
       if (error) throw error;
       row = data;
     } catch (e) {
-      console.error('[V1 AUTH] credential lookup failed:', e.message);
-      return res.status(500).json({ error: { type: 'server_error', message: 'Could not verify credential.' } });
+      // Code-review fix: this proxy's deploy and its SQL migrations are on
+      // separate, manually-run schedules (see
+      // sql/ai-cost-tower-trace-layer-payload-infra-migration.sql's own
+      // header comment) — there is no guarantee the migration adding the
+      // four scope/toggle columns above has been applied to a given
+      // environment (dev or prod) by the time this code runs there.
+      // Postgres/PostgREST's "undefined_column" error (42703) is the one,
+      // specific, narrow signal for exactly that gap; falling back to the
+      // original minimal select for that one error code means every
+      // existing /v1 credential keeps working (with payload-capture simply
+      // unavailable, matching pre-this-release behavior) instead of the
+      // entire /v1 API going down for every tenant — this middleware is
+      // mounted globally ahead of all six /v1 routers — until the migration
+      // is applied. Any other error still fails closed as before.
+      if (e && e.code === '42703') {
+        try {
+          const { data, error: fallbackError } = await supabaseAdmin
+            .from('mt_company_apps')
+            .select('company_id, app_id, is_active')
+            .eq('credential_hash', presentedHash)
+            .maybeSingle();
+          if (fallbackError) throw fallbackError;
+          row = data;
+          scopeColumnsAvailable = false;
+        } catch (fallbackErr) {
+          console.error('[V1 AUTH] credential lookup failed (fallback):', fallbackErr.message);
+          return res.status(500).json({ error: { type: 'server_error', message: 'Could not verify credential.' } });
+        }
+      } else {
+        console.error('[V1 AUTH] credential lookup failed:', e.message);
+        return res.status(500).json({ error: { type: 'server_error', message: 'Could not verify credential.' } });
+      }
     }
 
     if (!row || !row.is_active) {
@@ -97,6 +131,20 @@ module.exports = function apiKeyAuthFactory(supabaseAdmin) {
     // never accepted as payload fields from the request body (Section 2).
     req.companyId = row.company_id;
     req.appId = row.app_id;
+
+    // AI Trace Layer — Payload Capture Infrastructure (D.7 items 1-3):
+    // scope_usage_write/scope_traces_write are reserved, non-enforced this
+    // release (no route reads req.scopes.usageWrite/tracesWrite yet — see
+    // ai-trace-layer-payload-infra-followup-spec-v0.7.md §2.2/§2.3).
+    // requirePayloadCaptureWrite.js is the only current consumer of these.
+    // Defaults below (true/true/false/false) match the migration's own
+    // column defaults exactly, for the pre-migration fallback above.
+    req.scopes = {
+      usageWrite: scopeColumnsAvailable ? row.scope_usage_write : true,
+      tracesWrite: scopeColumnsAvailable ? row.scope_traces_write : true,
+      payloadsWrite: scopeColumnsAvailable ? row.scope_payloads_write : false
+    };
+    req.payloadCaptureEnabled = scopeColumnsAvailable ? row.payload_capture_enabled : false;
 
     _touchCredentialLastUsedOpportunistic(supabaseAdmin, row.company_id, row.app_id);
 

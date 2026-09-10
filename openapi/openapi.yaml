@@ -620,7 +620,7 @@ components:
       required: [client_call_id, user_role_at_call, caller, requested_model, status, request_started_at]
       properties:
         client_call_id: { type: string, format: uuid, description: "Your own UUID, idempotency key" }
-        provider: { type: string, default: anthropic }
+        provider: { type: string, default: anthropic, description: "One of anthropic/openai/gemini (case-insensitive). Determines which provider_usage_raw shape is accepted below — any other value is validated against Anthropic's shape." }
         product_id: { type: string, format: uuid, nullable: true, description: "Omit for non-Product-Studio apps" }
         session_id: { type: string, nullable: true, description: "Your own stable identifier grouping related actions" }
         user_id: { type: string, nullable: true, description: "Plain UUID, no FK, use your own internal identifier" }
@@ -641,7 +641,7 @@ components:
         cache_creation_5m_tokens: { type: integer, nullable: true }
         cache_creation_1h_tokens: { type: integer, nullable: true }
         cache_read_tokens: { type: integer, nullable: true }
-        provider_usage_raw: { type: object, nullable: true, description: "jsonb escape hatch" }
+        provider_usage_raw: { type: object, nullable: true, description: "Your provider's raw usage/cache-token response, stored opaquely for audit reference. As of v9.33.01, only the exact key names/types your declared provider's API actually returns are accepted (e.g. Anthropic's input_tokens/output_tokens/cache_creation/etc.) — an unrecognized key, wrong type, or a payload over 2048 bytes serialized is rejected, not silently stripped. This is not a general-purpose metadata field." }
         status: { type: string, enum: [success, error, timeout] }
         provider_http_status: { type: integer, nullable: true }
         error_type: { type: string, nullable: true }

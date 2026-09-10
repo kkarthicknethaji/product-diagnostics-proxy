@@ -14,6 +14,144 @@ const REQUIRED_FIELDS = ['client_call_id', 'user_role_at_call', 'caller', 'reque
 const BATCH_CAP = 500;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// AI Trace Layer — Payload Capture Infrastructure (D.7 bypass invariant).
+// Spec: ai-trace-layer-payload-infra-followup-spec-v0.7.md, §4.1a.
+//
+// provider_usage_raw exists to carry a provider's raw token/cache-usage
+// response, persisted opaquely (no downstream key ever unpacked from it —
+// see usageEventRpcParams.js / the SQL RPC). Without this allowlist, an
+// external caller of this route could put arbitrary content — including
+// full prompt/response text — inside this JSONB blob and it would persist
+// exactly as submitted, bypassing the invariant that model-visible content
+// only ever enters through the not-yet-built, payload-gated
+// /v1/trace-payloads route. Scope note (code-review fix): this only
+// instruments this external route's own caller-controlled input — it does
+// NOT validate proxy/server.js's internal _insertAiUsageEvent() path, which
+// writes provider_usage_raw from this proxy's own trusted provider-adapter
+// responses (never a caller's JSON body), so was never the bypass this
+// allowlist closes.
+//
+// Each provider's table is traced to that provider's own adapter in
+// proxy/providerAdapters.js, not to provider documentation — see the spec
+// for the exact citation per key. cache_creation_input_tokens/service_tier
+// (Anthropic) are real, documented Anthropic fields included proactively,
+// not currently read by this codebase. Gemini's input_tokens_by_modality
+// is the one field in this table without a bounded element-type check —
+// its shape isn't confirmed anywhere in live code — accepted as any array,
+// controlled only by the total-size backstop below (an explicit, one-off
+// exception, not a precedent for future uncertain fields).
+const PROVIDER_USAGE_RAW_MAX_BYTES = 2048;
+const PROVIDER_USAGE_RAW_ALLOWLISTS = {
+  anthropic: {
+    input_tokens: { type: 'integer' },
+    output_tokens: { type: 'integer' },
+    cache_read_input_tokens: { type: 'integer' },
+    cache_creation_input_tokens: { type: 'integer' },
+    service_tier: { type: 'string', maxLength: 32, pattern: /^[a-z_]+$/ },
+    cache_creation: {
+      type: 'object',
+      nestedKeys: {
+        ephemeral_5m_input_tokens: { type: 'integer' },
+        ephemeral_1h_input_tokens: { type: 'integer' }
+      }
+    }
+  },
+  openai: {
+    input_tokens: { type: 'integer' },
+    output_tokens: { type: 'integer' },
+    total_tokens: { type: 'integer' },
+    input_tokens_details: { type: 'object', nestedKeys: { cached_tokens: { type: 'integer' } } }
+  },
+  gemini: {
+    total_input_tokens: { type: 'integer' },
+    total_output_tokens: { type: 'integer' },
+    total_tokens: { type: 'integer' },
+    total_cached_tokens: { type: 'integer' },
+    total_thought_tokens: { type: 'integer' },
+    total_tool_use_tokens: { type: 'integer' },
+    // [VERIFY] element shape not confirmed against live Gemini docs/traffic —
+    // accept any array, per Nethaji's explicit decision (spec §0.0c).
+    input_tokens_by_modality: { type: 'array' }
+  }
+};
+
+// Code-review fix: a plain `obj[key]` lookup on a caller-controlled string
+// resolves inherited Object.prototype members (e.g. key === 'constructor' or
+// '__proto__') instead of undefined for any key this codebase never defined
+// on that object — which silently defeats every `if (!rule)`
+// unrecognized-key rejection below and, once resolved to a function like
+// `Object.prototype.constructor`, crashes the process when its own
+// (nonexistent) `.nestedKeys` is indexed into further down. Confirmed live:
+// `provider_usage_raw: {"constructor": {"prompt": "..."}}` threw an
+// uncaught TypeError all the way out of this async route handler, and
+// `{"constructor": {}}` (empty) was silently accepted despite not being an
+// allowed key. `_ownGet` restores the intended "only a key this table
+// actually defines" semantics.
+function _ownGet(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+}
+
+function _validateProviderUsageRawValue(value, rule, path) {
+  if (rule.type === 'integer') {
+    return Number.isInteger(value) ? null : path + ' must be an integer.';
+  }
+  if (rule.type === 'string') {
+    if (typeof value !== 'string') return path + ' must be a string.';
+    if (rule.maxLength != null && value.length > rule.maxLength) return path + ' exceeds the maximum length of ' + rule.maxLength + '.';
+    if (rule.pattern && !rule.pattern.test(value)) return path + ' has an invalid format.';
+    return null;
+  }
+  if (rule.type === 'array') {
+    return Array.isArray(value) ? null : path + ' must be an array.';
+  }
+  // rule.type === 'object' — the only remaining case in the tables above.
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return path + ' must be an object.';
+  }
+  for (const nestedKey of Object.keys(value)) {
+    const nestedRule = _ownGet(rule.nestedKeys, nestedKey);
+    if (!nestedRule) return path + ' contains an unrecognized key: ' + nestedKey;
+    const nestedError = _validateProviderUsageRawValue(value[nestedKey], nestedRule, path + '.' + nestedKey);
+    if (nestedError) return nestedError;
+  }
+  return null;
+}
+
+// Reject, not strip — an item with any key outside its provider's table,
+// any wrong-typed value, any oversized string, any excess nesting, or an
+// oversized total payload fails the whole item with a clear message,
+// exactly like a missing required field already does. Unrecognized/omitted
+// provider falls back to Anthropic's table (today's existing default is
+// `item.provider || 'anthropic'`, unchanged by this fix).
+function _validateProviderUsageRaw(providerUsageRaw, provider) {
+  if (providerUsageRaw == null) return null;
+  if (typeof providerUsageRaw !== 'object' || Array.isArray(providerUsageRaw)) {
+    return 'provider_usage_raw must be an object.';
+  }
+
+  let serialized;
+  try { serialized = JSON.stringify(providerUsageRaw); } catch (e) { return 'provider_usage_raw could not be serialized.'; }
+  if (Buffer.byteLength(serialized, 'utf8') > PROVIDER_USAGE_RAW_MAX_BYTES) {
+    return 'provider_usage_raw exceeds the maximum size of ' + PROVIDER_USAGE_RAW_MAX_BYTES + ' bytes.';
+  }
+
+  // Normalized (lowercased/trimmed) for table selection only — matches this
+  // codebase's own established convention (providerAdapters.js's `adapters`
+  // map keys are always lowercase 'anthropic'/'openai'/'gemini'); the raw
+  // `provider` value is still what's stored/sent to the RPC, unchanged.
+  const normalizedProvider = typeof provider === 'string' ? provider.trim().toLowerCase() : provider;
+  const allowlist = _ownGet(PROVIDER_USAGE_RAW_ALLOWLISTS, normalizedProvider) || PROVIDER_USAGE_RAW_ALLOWLISTS.anthropic;
+  for (const key of Object.keys(providerUsageRaw)) {
+    const rule = _ownGet(allowlist, key);
+    if (!rule) {
+      return 'provider_usage_raw contains an unrecognized key for provider \'' + provider + '\': ' + key;
+    }
+    const error = _validateProviderUsageRawValue(providerUsageRaw[key], rule, 'provider_usage_raw.' + key);
+    if (error) return error;
+  }
+  return null;
+}
+
 function _validateItem(item) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) {
     return 'Item must be an object.';
@@ -47,6 +185,8 @@ function _validateItem(item) {
   if (item.client_trace_id != null && (item.agent_name == null || item.agent_name === '')) {
     return 'agent_name is required when client_trace_id is present.';
   }
+  const providerUsageRawError = _validateProviderUsageRaw(item.provider_usage_raw, item.provider || 'anthropic');
+  if (providerUsageRawError) return providerUsageRawError;
   return null;
 }
 
