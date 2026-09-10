@@ -6,8 +6,8 @@
 // a require() cycle).
 
 const express = require('express');
-const { insertIdempotent } = require('../../lib/costTower/idempotency');
 const { updateUnitsGenerated } = require('../../lib/costTower/unitsGenerated');
+const { buildUsageEventRpcParams } = require('../../lib/costTower/usageEventRpcParams');
 
 const STATUS_VALUES = ['success', 'error', 'timeout'];
 const REQUIRED_FIELDS = ['client_call_id', 'user_role_at_call', 'caller', 'requested_model', 'status', 'request_started_at'];
@@ -38,6 +38,14 @@ function _validateItem(item) {
   // caller mistake from collaterally rejecting the rest of the batch.
   if (item.outcome_id != null && !UUID_RE.test(String(item.outcome_id))) {
     return 'outcome_id must be a valid UUID.';
+  }
+  // AI Trace Layer — client_trace_id is the only trace-continuation key
+  // (spec Invariant 2); agent_name is required whenever it's present, same
+  // rule the RPC itself enforces (mt_ai_record_usage_event_with_span raises
+  // ERRCODE 22023 otherwise) — checked here too so a caller gets a clean 400
+  // instead of a database-level error surfacing as a 500.
+  if (item.client_trace_id != null && (item.agent_name == null || item.agent_name === '')) {
+    return 'agent_name is required when client_trace_id is present.';
   }
   return null;
 }
@@ -107,25 +115,57 @@ async function _fetchOwnedOutcomeIds(supabaseAdmin, companyId, appId, outcomeIds
   return new Set((data || []).map(function (r) { return r.outcome_id; }));
 }
 
-function _buildRow(item, companyId, appId) {
-  // settings_mode/selection_rule default to 'external' when omitted — this
-  // route is the consumer-tier ingestion surface, never Product Studio's
-  // own /api/anthropic path, so defaulting unconditionally (rather than
-  // conditioning on appId !== 'product-studio') matches every real caller
-  // this endpoint will ever see.
-  return {
+// ownedOutcomeIds is pre-fetched once per batch (see _fetchOwnedOutcomeIds)
+// rather than re-checked per item — without this check at all, a
+// caller-supplied outcome_id from a DIFFERENT (company_id, app_id) would
+// still satisfy the plain FK on mt_ai_usage_events.outcome_id (existence
+// only, not ownership) and persist a permanent cross-tenant reference.
+// Mirrors the same ownership guarantee PATCH /v1/outcomes/{id} enforces.
+//
+// AI Trace Layer — this now calls mt_ai_record_usage_event_with_span()
+// instead of a direct table insert, so this route and Product Studio's own
+// /api/anthropic path share exactly one place a usage event (and its
+// optional span/trace) is ever written. session_type/prompt_version/
+// settings_model have no equivalent concept for an external caller — this
+// route never accepted them before either, so they're passed as null,
+// same as they were simply absent from _buildRow()'s old row shape.
+async function _processItem(supabaseAdmin, item, companyId, appId, ownedOutcomeIds) {
+  const validationError = _validateItem(item);
+  if (validationError) {
+    return { error: { type: 'invalid_request', message: validationError } };
+  }
+
+  if (item.outcome_id != null && !ownedOutcomeIds.has(item.outcome_id)) {
+    return { error: { type: 'invalid_request', message: 'outcome_id does not exist or does not belong to this credential.' } };
+  }
+
+  // Normalize this item's own field names/defaults into the shared shape
+  // buildUsageEventRpcParams() expects, then let it own the field->p_*
+  // mapping — code-review fix, closing the drift risk between this and
+  // server.js's independent copy of the same ~34-key mapping (this RPC's
+  // parameter list already went out of sync with calling code once, see
+  // ai-cost-tower-trace-layer-migration.sql's Step 4 reconciliation note).
+  const { data, error } = await supabaseAdmin.rpc('mt_ai_record_usage_event_with_span', buildUsageEventRpcParams({
     company_id: companyId,
     app_id: appId,
     client_call_id: item.client_call_id,
     provider: item.provider || 'anthropic',
     product_id: item.product_id != null ? item.product_id : null,
     session_id: item.session_id != null ? item.session_id : null,
+    session_type: null,
     user_id: item.user_id != null ? item.user_id : null,
     user_role_at_call: item.user_role_at_call,
     caller: item.caller,
+    prompt_version: null,
     requested_model: item.requested_model,
     response_model: item.response_model != null ? item.response_model : null,
+    // settings_mode/selection_rule default to 'external' when omitted — this
+    // route is the consumer-tier ingestion surface, never Product Studio's
+    // own /api/anthropic path, so defaulting unconditionally (rather than
+    // conditioning on appId !== 'product-studio') matches every real caller
+    // this endpoint will ever see.
     settings_mode: item.settings_mode || 'external',
+    settings_model: null,
     selection_rule: item.selection_rule || 'external',
     input_tokens: item.input_tokens != null ? item.input_tokens : null,
     output_tokens: item.output_tokens != null ? item.output_tokens : null,
@@ -142,47 +182,33 @@ function _buildRow(item, companyId, appId) {
     request_bytes: item.request_bytes != null ? item.request_bytes : null,
     response_bytes: item.response_bytes != null ? item.response_bytes : null,
     outcome_id: item.outcome_id != null ? item.outcome_id : null,
-    units_generated: item.units_generated != null ? item.units_generated : null
-  };
-}
+    units_generated: item.units_generated != null ? item.units_generated : null,
+    client_trace_id: item.client_trace_id != null ? item.client_trace_id : null,
+    agent_name: item.agent_name != null ? item.agent_name : null
+  }));
 
-// ownedOutcomeIds is pre-fetched once per batch (see _fetchOwnedOutcomeIds)
-// rather than re-checked per item — without this check at all, a
-// caller-supplied outcome_id from a DIFFERENT (company_id, app_id) would
-// still satisfy the plain FK on mt_ai_usage_events.outcome_id (existence
-// only, not ownership) and persist a permanent cross-tenant reference.
-// Mirrors the same ownership guarantee PATCH /v1/outcomes/{id} enforces.
-async function _processItem(supabaseAdmin, item, companyId, appId, ownedOutcomeIds) {
-  const validationError = _validateItem(item);
-  if (validationError) {
-    return { error: { type: 'invalid_request', message: validationError } };
-  }
-
-  if (item.outcome_id != null && !ownedOutcomeIds.has(item.outcome_id)) {
-    return { error: { type: 'invalid_request', message: 'outcome_id does not exist or does not belong to this credential.' } };
-  }
-
-  const row = _buildRow(item, companyId, appId);
-  const result = await insertIdempotent(supabaseAdmin, {
-    table: 'mt_ai_usage_events',
-    conflictColumns: ['company_id', 'app_id', 'client_call_id'],
-    row: row,
-    idColumn: 'id'
-  });
-
-  if (result.error) {
+  if (error) {
+    // 23514 = check_violation, raised by the RPC itself for a replayed
+    // client_call_id/client_trace_id with different identity fields — a
+    // genuine integration bug on the caller's side, mapped to 409 per spec
+    // Part D.4 (distinct from Product Studio's own internal wrapper, which
+    // must swallow this same exception rather than surface it to an end user).
+    if (error.code === '23514') {
+      return { error: { type: 'conflict', message: error.message } };
+    }
     // 23503 = foreign_key_violation — same translation outcomes.js already
     // does for its own FK (e.g. a bad outcome_type_id); without this, a
     // permanent client input error (a stale/bad reference) surfaced as an
     // undifferentiated 500 instead of a 400.
-    if (result.error.code === '23503') {
+    if (error.code === '23503') {
       return { error: { type: 'invalid_request', message: 'One of the referenced ids (e.g. outcome_id) does not exist.' } };
     }
-    console.error('[V1 USAGE-EVENTS] insert failed:', result.error.message);
+    console.error('[V1 USAGE-EVENTS] rpc failed:', error.message);
     return { error: { type: 'server_error', message: 'Could not record usage event.' } };
   }
 
-  return { id: result.id, deduplicated: result.deduplicated, outcomeId: row.outcome_id };
+  const row = data[0];
+  return { id: row.usage_event_id, deduplicated: row.was_duplicate, outcomeId: item.outcome_id != null ? item.outcome_id : null };
 }
 
 module.exports = function usageEventsRouterFactory(supabaseAdmin) {
@@ -244,7 +270,14 @@ module.exports = function usageEventsRouterFactory(supabaseAdmin) {
 
     if (!isBatch) {
       const only = results[0];
-      if (only.error) return res.status(400).json({ error: only.error });
+      if (only.error) {
+        // AI Trace Layer — 'conflict' is a new error type _processItem() can
+        // now return (a replayed client_call_id/client_trace_id with
+        // different identity fields); map it to 409, per spec Part D.4,
+        // rather than the flat 400 every error type got before this existed.
+        const _statusByType = { invalid_request: 400, conflict: 409, server_error: 500 };
+        return res.status(_statusByType[only.error.type] || 400).json({ error: only.error });
+      }
       return res.status(200).json({ id: only.id, deduplicated: only.deduplicated });
     }
 
@@ -317,7 +350,7 @@ module.exports = function usageEventsRouterFactory(supabaseAdmin) {
 
     let query = supabaseAdmin
       .from('mt_ai_usage_events')
-      .select('id, request_started_at, provider, requested_model, response_model, caller, session_id, user_id, user_role_at_call, status, error_type, failure_phase, duration_ms, request_bytes, response_bytes, input_tokens, output_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, outcome_id, units_generated')
+      .select('id, request_started_at, provider, requested_model, response_model, caller, session_id, user_id, user_role_at_call, status, error_type, failure_phase, duration_ms, request_bytes, response_bytes, input_tokens, output_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, outcome_id, units_generated, trace_id')
       .eq('company_id', req.companyId)
       .eq('app_id', req.appId)
       .gte('request_started_at', start)

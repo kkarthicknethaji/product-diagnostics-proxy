@@ -41,6 +41,13 @@ info:
     (Separate from the app's own CHANGELOG.md — this section tracks the
     `/v1` contract itself.)
 
+    - **v1.1.0** — AI Trace Layer. `traces` (create, complete, read, read
+      spans) and `tool-spans` (record a tool-call step, with or without an
+      LLM call) — correlates related usage events into one conversation and
+      exposes per-call cost/token/duration breakdowns. `usage-events` gains
+      optional `client_trace_id`/`agent_name` on write and `trace_id` on
+      read-back. Fully additive — no existing field or endpoint changed
+      shape.
     - **v1.0.0** — initial publication. `usage-events` (create, batch,
       units-generated report-back, scoped read-back), `outcomes` (create,
       complete), `outcome-types` (register, list), `company-apps/me`.
@@ -63,6 +70,10 @@ tags:
     description: Create and complete outcome instances (a session's worth of related usage events).
   - name: outcome-types
     description: Register and list your app's own outcome taxonomy.
+  - name: traces
+    description: Correlate related usage events into one conversation/agent run.
+  - name: tool-spans
+    description: Record a tool-call step, whether or not it involved an LLM call.
   - name: company-apps
     description: Self-check on your own credential.
 
@@ -106,6 +117,17 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: |
+            Single-item request only: client_call_id or client_trace_id
+            already recorded with different identity fields (a genuine
+            replay conflict, not a duplicate submission of identical data —
+            those are silently deduplicated). Never returned for a batch
+            request, whose per-item conflicts appear inside the 200 response
+            body's `results` array instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
     get:
       operationId: listUsageEvents
       tags: [usage-events]
@@ -334,6 +356,183 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /v1/traces:
+    post:
+      operationId: createTrace
+      tags: [traces]
+      summary: Create a trace explicitly, ahead of your first usage event
+      description: |
+        Not the only way a trace comes into existence — `POST /v1/usage-events`
+        creates one implicitly via `client_trace_id` if you haven't called
+        this first. Use this when you want `product_id`/`session_id`/
+        `outcome_id` set at creation time rather than picked up from your
+        first usage event. Idempotent on `client_trace_id`: a resubmission
+        with the same `agent_name`/`session_id` is a no-op; a mismatch is a
+        409 (a genuine identity conflict on your own idempotency key, not
+        something to silently paper over).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_name, client_trace_id]
+              properties:
+                agent_name: { type: string }
+                client_trace_id: { type: string, description: "Your own UUID, generated once per conversation/agent run" }
+                session_id: { type: string, nullable: true, description: "Intentionally not required — no session concept is forced on you" }
+                product_id: { type: string, format: uuid, nullable: true }
+                outcome_id: { type: string, format: uuid, nullable: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trace_id: { type: string, format: uuid }
+                  deduplicated: { type: boolean }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: client_trace_id already registered with a different agent_name or session_id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /v1/traces/{id}:
+    get:
+      operationId: getTrace
+      tags: [traces]
+      summary: Read one trace
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TraceRecord' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: completeTrace
+      tags: [traces]
+      summary: Mark a trace completed
+      description: Sets `completed_at` only. Ownership-checked by `(company_id, app_id)`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trace_id: { type: string, format: uuid }
+                  completed_at: { type: string, format: date-time }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/traces/{id}/spans:
+    get:
+      operationId: listTraceSpans
+      tags: [traces]
+      summary: "The \"why did this run cost 4x average\" query"
+      description: |
+        Every span in the trace, in `sequence_order`. An `llm_call` span
+        embeds its `mt_ai_usage_events` row's cost/token/model/duration
+        fields; a `tool_call` span has none (its own `duration_ms` is stored
+        directly on the span instead, since it may involve no LLM call at all).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  spans:
+                    type: array
+                    items: { $ref: '#/components/schemas/SpanRecord' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/tool-spans:
+    post:
+      operationId: createToolSpan
+      tags: [tool-spans]
+      summary: Record a tool-call step
+      description: |
+        For a step in your agent's run that involved no LLM API call at all
+        (or one you don't want counted as a separate usage event). Creates
+        the trace implicitly on first use, same as `POST /v1/usage-events`.
+        No idempotency key on this endpoint — a tool call has no natural
+        client-generated identity to dedupe on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_name, client_trace_id, tool_name, status]
+              properties:
+                agent_name: { type: string }
+                client_trace_id: { type: string }
+                tool_name: { type: string }
+                parent_span_id:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: "Typically the llm_call span that decided to invoke this tool. Must belong to the same trace."
+                attempt_number:
+                  type: integer
+                  minimum: 1
+                  nullable: true
+                  description: "Which attempt this was (1 = first try), not a boolean loop flag — only set this if your own logic tracks retry identity."
+                status: { type: string, enum: [success, error, timeout] }
+                duration_ms: { type: integer, nullable: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  span_id: { type: string, format: uuid }
+                  trace_id: { type: string, format: uuid }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: client_trace_id replay with a different agent_name, or parent_span_id doesn't belong to this trace.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
   /v1/company-apps/me:
     get:
       operationId: getCredentialStatus
@@ -453,6 +652,14 @@ components:
         response_bytes: { type: integer, nullable: true }
         outcome_id: { type: string, format: uuid, nullable: true, description: "Set if this event belongs to an outcome created via /v1/outcomes" }
         units_generated: { type: integer, nullable: true, description: "Only meaningful for yield_ratio-costed outcome types" }
+        client_trace_id:
+          type: string
+          nullable: true
+          description: "Your own trace-continuation key (AI Trace Layer). Generate it once per conversation/agent run and send it on every call belonging to that run, forever — never a server-generated id. Creates the trace implicitly on first use if you haven't called POST /v1/traces first. Requires agent_name."
+        agent_name:
+          type: string
+          nullable: true
+          description: "Required if client_trace_id is present. Your own name for the agent/flow this call belongs to."
 
     UsageEventRecord:
       allOf:
@@ -460,6 +667,7 @@ components:
         - type: object
           properties:
             id: { type: string }
+            trace_id: { type: string, format: uuid, nullable: true }
             calculated_cost:
               type: number
               nullable: true
@@ -476,3 +684,42 @@ components:
         costing_method: { type: string, enum: [session_sum, yield_ratio] }
         unit_label: { type: string, description: "Noun matching units_generated" }
         abandonment_window_hrs: { type: integer, nullable: true, description: "Hours of inactivity before auto-flagged abandoned" }
+
+    TraceRecord:
+      type: object
+      properties:
+        trace_id: { type: string, format: uuid }
+        agent_name: { type: string }
+        session_id: { type: string, nullable: true }
+        product_id: { type: string, format: uuid, nullable: true }
+        outcome_id: { type: string, format: uuid, nullable: true }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+
+    SpanRecord:
+      type: object
+      properties:
+        span_id: { type: string, format: uuid }
+        parent_span_id: { type: string, format: uuid, nullable: true }
+        span_type: { type: string, enum: [llm_call, tool_call] }
+        tool_name: { type: string, nullable: true, description: "Set only for a tool_call span" }
+        sequence_order: { type: integer }
+        attempt_number: { type: integer, nullable: true }
+        status: { type: string, enum: [success, error, timeout] }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+        duration_ms:
+          type: integer
+          nullable: true
+          description: "Only populated directly for a tool_call span — an llm_call span's duration comes from its embedded usage-event object instead."
+        mt_ai_usage_events:
+          type: object
+          nullable: true
+          description: "Present only for an llm_call span; null for tool_call."
+          properties:
+            requested_model: { type: string }
+            response_model: { type: string, nullable: true }
+            provider: { type: string }
+            input_tokens: { type: integer, nullable: true }
+            output_tokens: { type: integer, nullable: true }
+            duration_ms: { type: integer, nullable: true }

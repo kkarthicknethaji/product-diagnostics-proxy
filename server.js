@@ -45,10 +45,13 @@ const jwksRsa   = require('jwks-rsa');
 const { createClient } = require('@supabase/supabase-js');
 const { getAdapter, isKnownModel } = require('./providerAdapters');
 const apiKeyAuth        = require('./middleware/apiKeyAuth');
+const { buildUsageEventRpcParams } = require('./lib/costTower/usageEventRpcParams');
 const usageEventsRouter = require('./routes/v1/usageEvents');
 const outcomesRouter    = require('./routes/v1/outcomes');
 const outcomeTypesRouter = require('./routes/v1/outcomeTypes');
 const companyAppsRouter = require('./routes/v1/companyApps');
+const tracesRouter      = require('./routes/v1/traces');
+const toolSpansRouter   = require('./routes/v1/toolSpans');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -170,16 +173,31 @@ const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
 // its failure is at least logged) before the response is sent.
 // Never throws — a usage-tracking failure must never surface to the user as
 // an AI-generation failure, so any error here is caught and logged only.
+// AI Trace Layer — replaces the old direct .insert() with the shared
+// transactional RPC (also called by proxy/routes/v1/usageEvents.js), so
+// there is exactly one place a usage event and its optional span are ever
+// written, and Product Studio's own calls can never drift from the external
+// ingestion path in how trace consistency or idempotency is enforced.
+// app_id is stamped here once (this proxy is Product Studio's own ingestion
+// path) rather than at every caller's field-building site, same as before.
 async function _insertAiUsageEvent(fields) {
   if (!supabaseAdmin) return; // telemetry is best-effort; never block on missing config
   try {
-    // app_id is NOT NULL post-migration; every event this proxy inserts is
-    // Product Studio's own, so it's stamped here once rather than at every
-    // caller's field-building site.
-    const { error } = await supabaseAdmin.from('mt_ai_usage_events').insert(Object.assign({ app_id: INGESTION_APP_ID }, fields));
-    if (error) console.error('[AI USAGE] insert failed:', error.message);
+    const { error } = await supabaseAdmin.rpc(
+      'mt_ai_record_usage_event_with_span',
+      buildUsageEventRpcParams(Object.assign({ app_id: INGESTION_APP_ID }, fields))
+    );
+    // An ERRCODE 23514 here means a replayed client_call_id/client_trace_id
+    // with genuinely different identity fields — extremely unlikely, but
+    // exactly the kind of telemetry-layer problem this function's own
+    // long-standing principle already covers: logged, never thrown outward.
+    // Unlike the external /v1/usage-events wrapper (which maps this same
+    // exception to 409 for an API consumer), this is Product Studio's own
+    // internal generation path — an end user waiting on a chat response
+    // must never see this as a failure.
+    if (error) console.error('[AI USAGE] rpc failed:', error.message);
   } catch (e) {
-    console.error('[AI USAGE] insert exception:', e.message);
+    console.error('[AI USAGE] rpc exception:', e.message);
   }
   // Opportunistic budget-alert check (AI Cost Control Tower, v9.28/v9.28.01)
   // — fire-and-forget, never awaited by the caller, so it adds no latency to
@@ -1200,7 +1218,7 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
 // currently only ever sent by Requirement Agent when its localStorage
 // streaming flag is on — see scripts/requirement-agent.js).
 async function _handleStreamingRequest(req, res, ctx) {
-  const { provider, adapter, upstreamReq, _caller, body, _requestStartedAt, _clientCallId, _sessionId, _sessionType, _productId, _userRoleAtCall, _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS, _outcomeId } = ctx;
+  const { provider, adapter, upstreamReq, _caller, body, _requestStartedAt, _clientCallId, _sessionId, _sessionType, _productId, _userRoleAtCall, _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS, _outcomeId, _clientTraceId, _agentName } = ctx;
   upstreamReq.body.stream = true;
 
   let _attempt = 0;
@@ -1238,7 +1256,8 @@ async function _handleStreamingRequest(req, res, ctx) {
         request_started_at: _requestStartedAt.toISOString(), duration_ms: _durationMs,
         request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes,
         outcome_id: _outcomeId,
-        units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, outcome.midStreamError ? 'error' : 'success')
+        units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, outcome.midStreamError ? 'error' : 'success'),
+        client_trace_id: _clientTraceId, agent_name: _agentName
       });
       return; // res already ended inside _streamUpstreamOnce
     }
@@ -1264,7 +1283,8 @@ async function _handleStreamingRequest(req, res, ctx) {
       request_started_at: _requestStartedAt.toISOString(), duration_ms: _durationMs,
       request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes,
       outcome_id: _outcomeId,
-      units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, 'error')
+      units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, 'error'),
+      client_trace_id: _clientTraceId, agent_name: _agentName
     });
     return res.status(200).json({ error: { type: _errVerdict._rawType || _errVerdict.normalizedErrorCode, message: _errVerdict.safeErrorMessage } });
   }
@@ -1281,7 +1301,7 @@ app.post('/api/anthropic', async (req, res) => {
   // making the entire error/timeout-path usage-tracking insert dead code.
   let _requestStartedAt, _clientCallId, _sessionId, _settingsMode, _settingsModel,
       _selectionRule, _promptVersion, _productId, _sessionType, _userRoleAtCall,
-      _outcomeId, _caller, bodyBytes;
+      _outcomeId, _caller, bodyBytes, _clientTraceId, _agentName;
   try {
     // v9.14: provider is resolved server-side by requireActiveCompanyMember
     // above (req.resolvedProvider) — NEVER taken from body.provider, which
@@ -1420,6 +1440,13 @@ app.post('/api/anthropic', async (req, res) => {
     _settingsModel = body.settings_model || null;
     _selectionRule = body.selection_rule || null;
     _promptVersion = body.prompt_version || null;
+    // AI Trace Layer — client_trace_id is the only trace-continuation key
+    // (Invariant 2); agent_name is required server-side (by the RPC) only
+    // when client_trace_id is present. Every caller that doesn't send these
+    // (everything except Requirement Agent) gets null for both, same as
+    // every other optional usage-tracking field above.
+    _clientTraceId = body.client_trace_id || null;
+    _agentName = body.agent_name || null;
 
     // v9.13.01: product_id is now derived server-side from session_id ->
     // mt_sessions.product_id, NOT trusted from the client's body.product_id
@@ -1518,7 +1545,7 @@ app.post('/api/anthropic', async (req, res) => {
         provider, adapter, upstreamReq, _caller, body, _requestStartedAt,
         _clientCallId, _sessionId, _sessionType, _productId, _userRoleAtCall,
         _settingsMode, _settingsModel, _selectionRule, _promptVersion, UPSTREAM_TIMEOUT_MS,
-        _outcomeId
+        _outcomeId, _clientTraceId, _agentName
       });
     }
 
@@ -1611,7 +1638,8 @@ app.post('/api/anthropic', async (req, res) => {
       request_bytes: bodyBytes,
       response_bytes: responseBytes,
       outcome_id: _outcomeId,
-      units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, _isErrorPayload ? 'error' : 'success')
+      units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, _isErrorPayload ? 'error' : 'success'),
+      client_trace_id: _clientTraceId, agent_name: _agentName
     });
 
     // v9.14: provider-neutral response envelope (Section 5.4) — the client's
@@ -1679,7 +1707,9 @@ app.post('/api/anthropic', async (req, res) => {
         request_bytes: typeof bodyBytes !== 'undefined' ? bodyBytes : null,
         response_bytes: null,
         outcome_id: typeof _outcomeId !== 'undefined' ? _outcomeId : null,
-        units_generated: typeof _caller !== 'undefined' ? _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, isTimeout ? 'timeout' : 'error') : null
+        units_generated: typeof _caller !== 'undefined' ? _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, isTimeout ? 'timeout' : 'error') : null,
+        client_trace_id: typeof _clientTraceId !== 'undefined' ? _clientTraceId : null,
+        agent_name: typeof _agentName !== 'undefined' ? _agentName : null
       });
     }
 
@@ -2612,6 +2642,8 @@ app.use('/v1', usageEventsRouter(supabaseAdmin));
 app.use('/v1', outcomesRouter(supabaseAdmin));
 app.use('/v1', outcomeTypesRouter(supabaseAdmin));
 app.use('/v1', companyAppsRouter(supabaseAdmin));
+app.use('/v1', tracesRouter(supabaseAdmin));
+app.use('/v1', toolSpansRouter(supabaseAdmin));
 // Code-review fix: an unmatched /v1 path/method previously fell through to
 // the file's global 404 catch-all below, which returns HTTP 200 — directly
 // contradicting this API's own documented status-code contract. Scoped
