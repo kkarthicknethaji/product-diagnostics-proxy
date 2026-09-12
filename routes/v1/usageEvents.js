@@ -23,8 +23,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // external caller of this route could put arbitrary content — including
 // full prompt/response text — inside this JSONB blob and it would persist
 // exactly as submitted, bypassing the invariant that model-visible content
-// only ever enters through the not-yet-built, payload-gated
-// /v1/trace-payloads route. Scope note (code-review fix): this only
+// only ever enters through the payload-gated /v1/trace-payloads route
+// (built v9.33.02, tracePayloads.js). Scope note (code-review fix): this only
 // instruments this external route's own caller-controlled input — it does
 // NOT validate proxy/server.js's internal _insertAiUsageEvent() path, which
 // writes provider_usage_raw from this proxy's own trusted provider-adapter

@@ -52,6 +52,7 @@ const outcomeTypesRouter = require('./routes/v1/outcomeTypes');
 const companyAppsRouter = require('./routes/v1/companyApps');
 const tracesRouter      = require('./routes/v1/traces');
 const toolSpansRouter   = require('./routes/v1/toolSpans');
+const tracePayloadsRouter = require('./routes/v1/tracePayloads');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -2644,6 +2645,7 @@ app.use('/v1', outcomeTypesRouter(supabaseAdmin));
 app.use('/v1', companyAppsRouter(supabaseAdmin));
 app.use('/v1', tracesRouter(supabaseAdmin));
 app.use('/v1', toolSpansRouter(supabaseAdmin));
+app.use('/v1', tracePayloadsRouter(supabaseAdmin));
 // Code-review fix: an unmatched /v1 path/method previously fell through to
 // the file's global 404 catch-all below, which returns HTTP 200 — directly
 // contradicting this API's own documented status-code contract. Scoped

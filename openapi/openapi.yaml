@@ -41,6 +41,11 @@ info:
     (Separate from the app's own CHANGELOG.md — this section tracks the
     `/v1` contract itself.)
 
+    - **v1.2.0** — AI Trace Layer: Payload Capture. `POST`/`GET
+      /v1/trace-payloads` — capture and read back a usage event's raw
+      request/response content. Gated: requires a credential with the
+      `payloads:write` scope AND the app's payload capture toggle enabled —
+      both default OFF, contact the platform operator to turn them on.
     - **v1.1.0** — AI Trace Layer. `traces` (create, complete, read, read
       spans) and `tool-spans` (record a tool-call step, with or without an
       LLM call) — correlates related usage events into one conversation and
@@ -74,6 +79,8 @@ tags:
     description: Correlate related usage events into one conversation/agent run.
   - name: tool-spans
     description: Record a tool-call step, whether or not it involved an LLM call.
+  - name: trace-payloads
+    description: Capture and read back a usage event's raw request/response content. Requires the payloads:write scope and the app's payload capture toggle, both default OFF.
   - name: company-apps
     description: Self-check on your own credential.
 
@@ -533,6 +540,81 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }
 
+  /v1/trace-payloads:
+    post:
+      operationId: createTracePayload
+      tags: [trace-payloads]
+      summary: Capture a usage event's raw request/response content
+      description: |
+        Gated: requires a credential with the `payloads:write` scope AND the
+        app's payload capture toggle enabled — both default OFF and are not
+        self-service, contact the platform operator. One payload per usage
+        event (1:1) — `usage_event_id` must already exist and belong to your
+        credential. Idempotent on `usage_event_id`: a resubmission with
+        identical content is a no-op; a mismatch is a 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [usage_event_id]
+              properties:
+                usage_event_id: { type: string, format: uuid, description: "Must already exist (from POST /v1/usage-events) and belong to your credential." }
+                request_payload: { type: object, nullable: true, description: "Your raw request content, stored opaquely. At least one of request_payload/response_payload is required." }
+                response_payload: { type: object, nullable: true, description: "Your raw response content, stored opaquely. At least one of request_payload/response_payload is required." }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payload_id: { type: string, format: uuid }
+                  deduplicated: { type: boolean }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Credential lacks the payloads:write scope, or the app's payload capture toggle is off.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '409':
+          description: usage_event_id already has a trace payload with different content.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /v1/trace-payloads/{usage_event_id}:
+    get:
+      operationId: getTracePayload
+      tags: [trace-payloads]
+      summary: Read back a captured trace payload
+      description: Same gating as the POST above. Ownership-scoped by `(company_id, app_id)`.
+      parameters:
+        - name: usage_event_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayloadRecord' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Credential lacks the payloads:write scope, or the app's payload capture toggle is off.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /v1/company-apps/me:
     get:
       operationId: getCredentialStatus
@@ -723,3 +805,13 @@ components:
             input_tokens: { type: integer, nullable: true }
             output_tokens: { type: integer, nullable: true }
             duration_ms: { type: integer, nullable: true }
+
+    PayloadRecord:
+      type: object
+      properties:
+        payload_id: { type: string, format: uuid }
+        usage_event_id: { type: string, format: uuid }
+        request_payload: { type: object, nullable: true }
+        response_payload: { type: object, nullable: true }
+        expires_at: { type: string, format: date-time, description: "Informational only in this release — nothing purges on this date yet." }
+        created_at: { type: string, format: date-time }
