@@ -184,7 +184,7 @@ const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
 async function _insertAiUsageEvent(fields) {
   if (!supabaseAdmin) return; // telemetry is best-effort; never block on missing config
   try {
-    const { error } = await supabaseAdmin.rpc(
+    const { data, error } = await supabaseAdmin.rpc(
       'mt_ai_record_usage_event_with_span',
       buildUsageEventRpcParams(Object.assign({ app_id: INGESTION_APP_ID }, fields))
     );
@@ -196,7 +196,23 @@ async function _insertAiUsageEvent(fields) {
     // exception to 409 for an API consumer), this is Product Studio's own
     // internal generation path — an end user waiting on a chat response
     // must never see this as a failure.
-    if (error) console.error('[AI USAGE] rpc failed:', error.message);
+    if (error) {
+      console.error('[AI USAGE] rpc failed:', error.message);
+    } else {
+      // Universal Payload Capture — a denial is observable (operator-facing
+      // only, never surfaced to the end user, never logs payload content
+      // itself) but not an error: the usage event above was still recorded
+      // normally regardless of this status.
+      const _row = data && data[0];
+      if (_row && _row.payload_capture_status === 'gate_disabled') {
+        console.warn('[AI PAYLOAD CAPTURE] gate_disabled', {
+          company_id: fields.company_id,
+          app_id: fields.app_id != null ? fields.app_id : INGESTION_APP_ID,
+          usage_event_id: _row.usage_event_id,
+          payload_capture_status: _row.payload_capture_status
+        });
+      }
+    }
   } catch (e) {
     console.error('[AI USAGE] rpc exception:', e.message);
   }
@@ -1093,6 +1109,62 @@ function _extractAnthropicCacheCreation(provider, rawUsage, field) {
   return v != null ? v : null;
 }
 
+// Universal Payload Capture — cap on how much of a streamed response's text
+// is retained for mt_ai_trace_payloads. Sized against real Requirement
+// Agent response lengths would need production data this build doesn't
+// have; 100KB is a deliberately generous starting point (the existing
+// 2048-byte cap on provider_usage_raw is for a small metadata object, not
+// full response text) and is safe to retune later — it only affects how
+// much of a streamed response's text is persisted, never what the client
+// receives.
+const MAX_PAYLOAD_CAPTURE_BYTES = 100 * 1024;
+
+// Universal Payload Capture — code-review fix: the streaming path's
+// accumulator was explicitly bounded by MAX_PAYLOAD_CAPTURE_BYTES, but
+// request_payload (all paths) and the non-streaming path's response_payload
+// content had no equivalent cap, risking an unbounded mt_ai_trace_payloads
+// JSONB row for a large conversation history or a large generated document.
+// Applied at the JSON-object level (not by slicing text), since neither of
+// these values is raw text — request_payload is {system, messages}, and the
+// non-streaming content is the adapter-normalized response object. Slicing
+// a serialized JSON string to fit a byte cap would produce invalid,
+// unparseable JSON; substituting a small marker object instead keeps every
+// persisted row valid to read back, which is more important here than
+// keeping a truncated prefix of an object that isn't just text.
+function _capJsonPayload(value, maxBytes) {
+  if (value == null) return value;
+  const _bytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
+  if (_bytes <= maxBytes) return value;
+  return { truncated: true, reason: 'exceeds_max_payload_capture_bytes', approx_bytes: _bytes };
+}
+
+// Universal Payload Capture — code-review fix: request_payload/
+// response_payload were hand-built near-identically at all 4
+// _insertAiUsageEvent() call sites in this file; shared here so a future
+// envelope-shape change (a new field, a schema version bump) is one edit,
+// not four kept in sync by hand.
+function _buildRequestPayload(body) {
+  // `body` is null/undefined only at the outer network/timeout catch-all,
+  // where it means "the request never even got this far" — that must stay
+  // a genuine NULL (nothing offered), not an object with null-valued keys
+  // (which the RPC's gate would treat as an offered-but-empty payload).
+  if (!body) return null;
+  return _capJsonPayload({
+    system: body.system != null ? body.system : null,
+    messages: body.messages != null ? body.messages : null
+  }, MAX_PAYLOAD_CAPTURE_BYTES);
+}
+
+function _buildResponsePayload(opts) {
+  return {
+    schema: 'response_payload_v1',
+    streamed: !!opts.streamed,
+    content_type: opts.content_type,
+    error: !!opts.error,
+    content: opts.content != null ? _capJsonPayload(opts.content, MAX_PAYLOAD_CAPTURE_BYTES) : null
+  };
+}
+
 function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog) {
   const https = require('https');
   const { StringDecoder } = require('string_decoder');
@@ -1102,6 +1174,17 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
 
   return new Promise((resolve, reject) => {
     let upstreamTimedOut = false;
+    // Universal Payload Capture — declared here, not inside the (upstreamRes)
+    // response callback below, because proxyReq.on('error', ...) is a SIBLING
+    // closure (also nested directly in this executor) that needs to read
+    // them too, on a mid-stream abort after headers are already sent. A
+    // `let` inside the response callback's own body would not be visible
+    // there — the same class of bug `usage: _emptyStreamUsage()` in that
+    // error handler already works around by rebuilding a fresh value instead
+    // of referencing the response callback's own `usage` local.
+    let accumulatedText = '';
+    let capturedBytes = 0;
+    let truncated = false;
     const options = {
       hostname: url.hostname,
       port: 443,
@@ -1133,6 +1216,16 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
       let sseBuffer = '';
       let responseBytes = 0;
       const usage = _emptyStreamUsage();
+      // Universal Payload Capture — accumulated at the parsedEvt.delta level
+      // (below), never off the raw `chunk` above. A raw network chunk is
+      // exactly what the StringDecoder two lines below exists to protect
+      // against splitting mid-UTF-8-character; parsedEvt.delta is already a
+      // complete, whole JS string (decoded via StringDecoder, framed on a
+      // complete SSE \n\n event, then JSON.parse'd), so accumulating there —
+      // and never slicing the accumulated string or a buffer afterward — is
+      // what keeps a truncated capture from ever landing mid-character.
+      // (accumulatedText/capturedBytes/truncated themselves are declared up
+      // in the executor scope above, not here — see that comment.)
       // StringDecoder (Node core), not Buffer#toString('utf8') per chunk —
       // a multi-byte UTF-8 character split across two TCP chunks would
       // otherwise decode independently in each chunk and come out as a
@@ -1153,6 +1246,19 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
           try { parsedEvt = adapter.parseSSEEvent(evt); } catch (e) { parsedEvt = { delta: null, usage: null, done: false }; }
           if (parsedEvt.delta) {
             try { res.write('data: ' + JSON.stringify({ delta: parsedEvt.delta }) + '\n\n'); } catch (e) {}
+            // Payload-capture accumulation is always secondary to forwarding
+            // above — it never gates or delays what the client receives, and
+            // a failure here must never break stream delivery. Stopping
+            // accumulation at the cap only affects what gets persisted.
+            if (!truncated) {
+              const _deltaBytes = Buffer.byteLength(parsedEvt.delta, 'utf8');
+              if (capturedBytes + _deltaBytes <= MAX_PAYLOAD_CAPTURE_BYTES) {
+                accumulatedText += parsedEvt.delta;
+                capturedBytes += _deltaBytes;
+              } else {
+                truncated = true;
+              }
+            }
           }
           if (parsedEvt.usage) {
             if (parsedEvt.usage.inputTokens != null) usage.inputTokens = parsedEvt.usage.inputTokens;
@@ -1173,7 +1279,7 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
 
       upstreamRes.on('end', () => {
         try { res.write('data: ' + JSON.stringify({ done: true }) + '\n\n'); res.end(); } catch (e) {}
-        resolve({ streamed: true, usage, requestBytes: bodyBytes, responseBytes });
+        resolve({ streamed: true, usage, requestBytes: bodyBytes, responseBytes, accumulatedText, capturedBytes, truncated });
       });
     });
 
@@ -1194,7 +1300,11 @@ function _streamUpstreamOnce(upstreamReq, timeoutMs, adapter, res, onTimeoutLog)
           res.write('data: ' + JSON.stringify({ error: true, message: upstreamTimedOut ? 'Upstream timed out mid-stream.' : ('Stream interrupted: ' + (err.message || 'unknown error')) }) + '\n\n');
           res.end();
         } catch (e) {}
-        resolve({ streamed: true, usage: _emptyStreamUsage(), requestBytes: bodyBytes, responseBytes: 0, midStreamError: true });
+        // Whatever text was accumulated up to the abort point is kept as a
+        // genuine partial — `truncated` here still means "the byte cap was
+        // hit," not "this is a partial capture because of the abort," so an
+        // abort with no cap hit correctly reports truncated: false.
+        resolve({ streamed: true, usage: _emptyStreamUsage(), requestBytes: bodyBytes, responseBytes: 0, midStreamError: true, accumulatedText, capturedBytes, truncated });
       } else {
         // No response ever received (headers never sent) — a genuine
         // transport-level failure, same as _callUpstream()'s own
@@ -1258,7 +1368,13 @@ async function _handleStreamingRequest(req, res, ctx) {
         request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes,
         outcome_id: _outcomeId,
         units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, outcome.midStreamError ? 'error' : 'success'),
-        client_trace_id: _clientTraceId, agent_name: _agentName
+        client_trace_id: _clientTraceId, agent_name: _agentName,
+        request_payload: _buildRequestPayload(body),
+        response_payload: _buildResponsePayload({
+          streamed: true, content_type: 'accumulated_text', error: outcome.midStreamError,
+          content: { text: outcome.accumulatedText, truncated: outcome.truncated,
+                     captured_bytes: outcome.capturedBytes, max_capture_bytes: MAX_PAYLOAD_CAPTURE_BYTES }
+        })
       });
       return; // res already ended inside _streamUpstreamOnce
     }
@@ -1285,7 +1401,14 @@ async function _handleStreamingRequest(req, res, ctx) {
       request_bytes: outcome.requestBytes, response_bytes: outcome.responseBytes,
       outcome_id: _outcomeId,
       units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, 'error'),
-      client_trace_id: _clientTraceId, agent_name: _agentName
+      client_trace_id: _clientTraceId, agent_name: _agentName,
+      // The request was already fully constructed before this buffered
+      // error response came back — request_payload is offered the same as
+      // every other call, regardless of outcome. No response text exists to
+      // capture here (the provider never confirmed 2xx), matching how the
+      // non-streaming error path also persists content: null.
+      request_payload: _buildRequestPayload(body),
+      response_payload: _buildResponsePayload({ streamed: true, content_type: 'accumulated_text', error: true, content: null })
     });
     return res.status(200).json({ error: { type: _errVerdict._rawType || _errVerdict.normalizedErrorCode, message: _errVerdict.safeErrorMessage } });
   }
@@ -1300,9 +1423,18 @@ app.post('/api/anthropic', async (req, res) => {
   // is what let this go unnoticed). Every `typeof X !== 'undefined'` guard
   // in the catch block below was silently always false before this fix,
   // making the entire error/timeout-path usage-tracking insert dead code.
+  //
+  // `body` was missed by that same fix and stayed a `const` declared inside
+  // the try (below) — unlike every other name in this list, the catch
+  // block's own reference to it (`body && body.model`) is a bare reference,
+  // not a `typeof` guard, so it threw ReferenceError on every single
+  // network-failure/timeout call reaching that catch block, rather than
+  // silently reading as unset like the others did before their fix. Hoisted
+  // here for the same reason, so both the existing `requested_model` read
+  // and this build's new `request_payload` read are actually reachable.
   let _requestStartedAt, _clientCallId, _sessionId, _settingsMode, _settingsModel,
       _selectionRule, _promptVersion, _productId, _sessionType, _userRoleAtCall,
-      _outcomeId, _caller, bodyBytes, _clientTraceId, _agentName;
+      _outcomeId, _caller, bodyBytes, _clientTraceId, _agentName, body;
   try {
     // v9.14: provider is resolved server-side by requireActiveCompanyMember
     // above (req.resolvedProvider) — NEVER taken from body.provider, which
@@ -1336,7 +1468,7 @@ app.post('/api/anthropic', async (req, res) => {
     }
 
     // Validate request body
-    const body = req.body;
+    body = req.body;
     if (!body || !body.model || !body.messages) {
       return res.status(200).json({
         error: {
@@ -1640,7 +1772,12 @@ app.post('/api/anthropic', async (req, res) => {
       response_bytes: responseBytes,
       outcome_id: _outcomeId,
       units_generated: _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, _isErrorPayload ? 'error' : 'success'),
-      client_trace_id: _clientTraceId, agent_name: _agentName
+      client_trace_id: _clientTraceId, agent_name: _agentName,
+      request_payload: _buildRequestPayload(body),
+      response_payload: _buildResponsePayload({
+        streamed: false, content_type: 'adapter_normalized', error: _isErrorPayload,
+        content: _isErrorPayload ? null : _normalized
+      })
     });
 
     // v9.14: provider-neutral response envelope (Section 5.4) — the client's
@@ -1710,7 +1847,19 @@ app.post('/api/anthropic', async (req, res) => {
         outcome_id: typeof _outcomeId !== 'undefined' ? _outcomeId : null,
         units_generated: typeof _caller !== 'undefined' ? _resolveUnitsGeneratedAtInsert(INGESTION_APP_ID, _caller, isTimeout ? 'timeout' : 'error') : null,
         client_trace_id: typeof _clientTraceId !== 'undefined' ? _clientTraceId : null,
-        agent_name: typeof _agentName !== 'undefined' ? _agentName : null
+        agent_name: typeof _agentName !== 'undefined' ? _agentName : null,
+        // No response was ever received here, but the request itself was
+        // already fully constructed before the network failure/timeout —
+        // request_payload is offered the same as every other call site,
+        // regardless of outcome. `body` is safe to reference directly here
+        // (hoisted above the try, unlike before this fix) rather than
+        // needing the typeof guard the other maybe-unset vars above use.
+        request_payload: _buildRequestPayload(body),
+        response_payload: _buildResponsePayload({
+          streamed: !!(body && body.stream),
+          content_type: (body && body.stream) ? 'accumulated_text' : 'adapter_normalized',
+          error: true, content: null
+        })
       });
     }
 
